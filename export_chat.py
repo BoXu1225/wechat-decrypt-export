@@ -384,6 +384,10 @@ if __name__ == "__main__":
                         help="Incremental export to export/<contact>/output_N.txt")
     args = parser.parse_args()
 
+    # Auto-decrypt (skips unchanged databases)
+    from decrypt_db import main as decrypt_main
+    decrypt_main()
+
     decrypted_dir = args.decrypted_dir or DEFAULT_DECRYPTED_DIR
     remark_name, wxid = resolve_contact(args.contact, decrypted_dir)
     if remark_name:
