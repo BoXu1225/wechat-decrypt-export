@@ -3,11 +3,12 @@
 Export a WeChat chat to a text file from decrypted databases.
 
 Usage:
-    python export_chat.py <contact_remark> [output_file]
+    python export_chat.py <contact_remark>
+    python export_chat.py <contact_remark> -o <output_file>
 
 Examples:
     python export_chat.py xx
-    python export_chat.py xx output/xx_chat.txt
+    python export_chat.py xx -o export/xx_chat.txt
 
 Requires:
     - Decrypted WeChat databases (via wechat-decrypt)
@@ -149,7 +150,7 @@ def export_chat(remark_name, output_file=None, decrypted_dir=None):
     contact_db = os.path.join(decrypted_dir, "contact", "contact.db")
 
     if output_file is None:
-        output_file = f"{remark_name}_chat.txt"
+        output_file = os.path.join(PROJECT_ROOT, "export", f"{remark_name}_chat.txt")
 
     if not os.path.isdir(msg_dir):
         print(f"Message directory not found: {msg_dir}")
