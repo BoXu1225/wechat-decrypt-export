@@ -93,6 +93,10 @@ Find `db_dir` by browsing `~/Library/Containers/com.tencent.xinWeChat/Data/Docum
 | `config.json` | Your local configuration |
 | `requirements.txt` | Python dependencies |
 
+## Acknowledgments
+
+Inspired by [wechat-decrypt](https://github.com/ylytdeng/wechat-decrypt) by [@ylytdeng](https://github.com/ylytdeng).
+
 ## Disclaimer
 
 This tool is for personal use only — to access **your own** WeChat data on your own machine. Respect applicable laws and do not use it for unauthorized data access.
@@ -193,6 +197,10 @@ python export_chat.py xxx -o chats/output.txt
 | `config.py` | 配置加载器 |
 | `config.json` | 本地配置文件 |
 | `requirements.txt` | Python 依赖 |
+
+## 致谢
+
+本项目受 [@ylytdeng](https://github.com/ylytdeng) 的 [wechat-decrypt](https://github.com/ylytdeng/wechat-decrypt) 启发。
 
 ## 免责声明
 
