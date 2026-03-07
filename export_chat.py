@@ -291,13 +291,16 @@ def export_chat(remark_name, output_file=None, decrypted_dir=None, incremental=F
                     f"SELECT 1 FROM [{t}] WHERE real_sender_id = ? LIMIT 1",
                     (target_rowid,)).fetchone()
                 if has:
-                    senders = conn.execute(
-                        f"SELECT COUNT(DISTINCT real_sender_id) FROM [{t}]"
-                    ).fetchone()[0]
-                    if senders <= 2:
+                    # Check it's a 1-on-1 chat: target + self should own nearly all messages
+                    total = conn.execute(f"SELECT count(*) FROM [{t}]").fetchone()[0]
+                    known_ids = [target_rowid] + ([my_rowid] if my_rowid else [])
+                    placeholders = ",".join("?" * len(known_ids))
+                    main_cnt = conn.execute(
+                        f"SELECT count(*) FROM [{t}] WHERE real_sender_id IN ({placeholders})",
+                        known_ids).fetchone()[0]
+                    if main_cnt >= total * 0.95:
                         found_dbs.append((db_path, t, target_rowid, my_rowid))
-                        cnt = conn.execute(f"SELECT count(*) FROM [{t}]").fetchone()[0]
-                        print(f"Found: {db_file} / {t} ({cnt} msgs)")
+                        print(f"Found: {db_file} / {t} ({total} msgs)")
                         break
             except Exception:
                 continue
