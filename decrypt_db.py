@@ -138,6 +138,7 @@ def main():
     print(f"找到 {len(db_files)} 个数据库文件\n")
 
     success = 0
+    skipped = 0
     failed = 0
     total_bytes = 0
 
@@ -151,6 +152,11 @@ def main():
 
         enc_key = bytes.fromhex(keys[rel_key]["enc_key"])
         out_path = os.path.join(OUT_DIR, rel)
+
+        # 跳过已解密且未变化的数据库
+        if os.path.exists(out_path) and os.path.getmtime(out_path) >= os.path.getmtime(path):
+            skipped += 1
+            continue
 
         print(f"解密: {rel} ({sz/1024/1024:.1f}MB) ...", end=" ")
 
@@ -176,8 +182,9 @@ def main():
             failed += 1
 
     print(f"\n{'='*60}")
-    print(f"结果: {success} 成功, {failed} 失败, 共 {len(db_files)} 个")
-    print(f"解密数据量: {total_bytes/1024/1024/1024:.1f}GB")
+    print(f"结果: {success} 成功, {skipped} 跳过(未变化), {failed} 失败, 共 {len(db_files)} 个")
+    if total_bytes > 0:
+        print(f"本次解密: {total_bytes/1024/1024/1024:.1f}GB")
     print(f"解密文件在: {OUT_DIR}")
 
 
