@@ -3,18 +3,21 @@
 Export a WeChat chat to a text file from decrypted databases.
 
 Usage:
-    python export_chat.py <contact_remark>
-    python export_chat.py <contact_remark> -o <output_file>
+    python export_chat.py <contact_pattern>
+    python export_chat.py <contact_pattern> -o <output_file>
+    python export_chat.py <contact_pattern> -i
 
 Examples:
-    python export_chat.py xx
-    python export_chat.py xx -o export/xx_chat.txt
+    python export_chat.py ning          # fuzzy match, pick from list
+    python export_chat.py xx -o out.txt
+    python export_chat.py xx -i         # incremental export
 
 Requires:
     - Decrypted WeChat databases (via wechat-decrypt)
     - pip install zstandard
 """
 import argparse
+import glob as globmod
 import sqlite3
 import re
 import os
@@ -142,15 +145,83 @@ def get_remark(wxid, contact_db):
     return None
 
 
-def export_chat(remark_name, output_file=None, decrypted_dir=None):
+def find_contacts(pattern, decrypted_dir):
+    """Find contacts whose remark/nickname contains the pattern (case-insensitive).
+    Returns list of (remark_name, wxid) tuples."""
+    msg_dir = os.path.join(decrypted_dir, "message")
+    contact_db = os.path.join(decrypted_dir, "contact", "contact.db")
+
+    db_files = sorted(
+        f for f in os.listdir(msg_dir)
+        if f.startswith("message_") and f.endswith(".db") and "fts" not in f
+    )
+
+    seen_wxids = set()
+    matches = []
+    pat_lower = pattern.lower()
+
+    for db_file in db_files:
+        db_path = os.path.join(msg_dir, db_file)
+        conn = sqlite3.connect(db_path)
+        try:
+            name2id = conn.execute("SELECT rowid, user_name FROM Name2Id").fetchall()
+        except Exception:
+            conn.close()
+            continue
+        for rowid, username in name2id:
+            if username in seen_wxids:
+                continue
+            seen_wxids.add(username)
+            r = get_remark(username, contact_db)
+            if r and pat_lower in r.lower():
+                matches.append((r, username))
+        conn.close()
+
+    return matches
+
+
+def resolve_contact(pattern, decrypted_dir):
+    """Resolve a contact pattern to (remark_name, wxid).
+    Exact match is tried first, then fuzzy. Prompts user if multiple matches."""
+    matches = find_contacts(pattern, decrypted_dir)
+    if not matches:
+        print(f"Could not find contact matching '{pattern}'")
+        return None, None
+
+    # Exact match takes priority
+    exact = [(r, w) for r, w in matches if r == pattern]
+    if len(exact) == 1:
+        return exact[0]
+
+    if len(matches) == 1:
+        print(f"Matched: {matches[0][0]}")
+        return matches[0]
+
+    # Multiple matches - show up to 5 and let user pick
+    print(f"Found {len(matches)} contacts matching '{pattern}':")
+    shown = matches[:5]
+    for i, (remark, wxid) in enumerate(shown, 1):
+        print(f"  {i}. {remark}")
+    if len(matches) > 5:
+        print(f"  ... and {len(matches) - 5} more (use a more specific pattern)")
+
+    while True:
+        try:
+            choice = input(f"Select [1-{len(shown)}]: ").strip()
+            idx = int(choice) - 1
+            if 0 <= idx < len(shown):
+                return shown[idx]
+        except (ValueError, EOFError):
+            pass
+        print(f"Please enter a number between 1 and {len(shown)}")
+
+
+def export_chat(remark_name, output_file=None, decrypted_dir=None, incremental=False):
     if decrypted_dir is None:
         decrypted_dir = DEFAULT_DECRYPTED_DIR
 
     msg_dir = os.path.join(decrypted_dir, "message")
     contact_db = os.path.join(decrypted_dir, "contact", "contact.db")
-
-    if output_file is None:
-        output_file = os.path.join(PROJECT_ROOT, "export", f"{remark_name}_chat.txt")
 
     if not os.path.isdir(msg_dir):
         print(f"Message directory not found: {msg_dir}")
@@ -161,7 +232,7 @@ def export_chat(remark_name, output_file=None, decrypted_dir=None):
         if f.startswith("message_") and f.endswith(".db") and "fts" not in f
     )
 
-    # First pass: find the target wxid from contact remarks
+    # Find the target wxid (remark_name is already resolved to exact name)
     target_wxid = None
     for db_file in db_files:
         db_path = os.path.join(msg_dir, db_file)
@@ -262,14 +333,39 @@ def export_chat(remark_name, output_file=None, decrypted_dir=None):
 
     all_rows.sort(key=lambda r: r[2])
 
+    # Determine output path and filter for incremental mode
+    after_ts = 0
+    if incremental:
+        inc_dir = os.path.join(PROJECT_ROOT, "export", remark_name)
+        os.makedirs(inc_dir, exist_ok=True)
+        existing = sorted(globmod.glob(os.path.join(inc_dir, "output_*.txt")))
+        if existing:
+            # Read last timestamp from the last existing file
+            with open(existing[-1], "r", encoding="utf-8") as f:
+                for line in reversed(f.readlines()):
+                    m = re.match(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]", line)
+                    if m:
+                        after_ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").timestamp()
+                        break
+        next_idx = len(existing)
+        output_file = os.path.join(inc_dir, f"output_{next_idx}.txt")
+    elif output_file is None:
+        output_file = os.path.join(PROJECT_ROOT, "export", f"{remark_name}_chat.txt")
+
     lines = []
     for local_type, sender, ts, content, ct in all_rows:
+        if ts <= after_ts:
+            continue
         text = decompress_if_needed(content, ct)
         display = format_message(text, local_type)
         if display is None:
             continue
         time_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
         lines.append(f"[{time_str}] {sender}: {display}")
+
+    if not lines:
+        print("No new messages to export.")
+        return
 
     os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
     with open(output_file, "w", encoding="utf-8") as f:
@@ -281,9 +377,14 @@ def export_chat(remark_name, output_file=None, decrypted_dir=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Export a WeChat chat to text file")
-    parser.add_argument("contact", help="Contact remark name (e.g. XXX)")
-    parser.add_argument("-o", "--output", help="Output file path (default: <contact>_chat.txt)")
+    parser.add_argument("contact", help="Contact name or partial match (e.g. 'ning')")
+    parser.add_argument("-o", "--output", help="Output file path (default: export/<contact>_chat.txt)")
     parser.add_argument("-d", "--decrypted-dir", help="Path to decrypted databases directory")
+    parser.add_argument("-i", "--incremental", action="store_true",
+                        help="Incremental export to export/<contact>/output_N.txt")
     args = parser.parse_args()
 
-    export_chat(args.contact, args.output, args.decrypted_dir)
+    decrypted_dir = args.decrypted_dir or DEFAULT_DECRYPTED_DIR
+    remark_name, wxid = resolve_contact(args.contact, decrypted_dir)
+    if remark_name:
+        export_chat(remark_name, args.output, args.decrypted_dir, args.incremental)
