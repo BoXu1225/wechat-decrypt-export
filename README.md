@@ -1,109 +1,6 @@
-# WeChat macOS Database Decryptor & Chat Exporter
-
-Our data, we own it! Decrypt WeChat 4.x (macOS) local SQLCipher 4 databases and export chat history to readable text files.
-
-## How it works
-
-WeChat 4.x encrypts local databases with SQLCipher 4:
-- **Encryption**: AES-256-CBC + HMAC-SHA512
-- **KDF**: PBKDF2-HMAC-SHA512, 256,000 iterations
-- **Page size**: 4096 bytes, reserve = 80 (IV 16 + HMAC 64)
-- **Each database has its own salt and encryption key**
-
-WCDB (WeChat's SQLCipher wrapper) caches derived raw keys in process memory as `x'<64hex_enc_key><32hex_salt>'`. This tool scans process memory for that pattern, matches keys to databases by salt, and decrypts them.
-
-Message content may be zstd-compressed (WCDB_CT=4, no dictionary). The export step handles decompression automatically.
-
-## Prerequisites
-
-- macOS (Apple Silicon / Intel)
-- WeChat 4.x running and logged in
-- Xcode Command Line Tools: `xcode-select --install`
-- Python 3.10+ with dependencies: `pip install -r requirements.txt`
-- WeChat must be **ad-hoc signed** (required for memory access):
-  ```bash
-  # SIP blocks signing in /Applications, so copy first
-  cp -R /Applications/WeChat.app ~/WeChat.app
-  codesign --force --deep --sign - ~/WeChat.app
-  # Launch ~/WeChat.app instead of the original
-  ```
-
-## Quick start
-
-### 1. Extract encryption keys
-
-```bash
-# Compile (one-time)
-cc -O2 -o find_all_keys_macos find_all_keys_macos.c -framework Foundation
-
-# Run (WeChat must be open, requires root)
-sudo ./find_all_keys_macos
-```
-
-Outputs `all_keys.json` mapping each database to its encryption key.
-
-### 2. Decrypt databases
-
-```bash
-python decrypt_db.py
-```
-
-Decrypts all databases to `decrypted/`. Validates each with HMAC and SQLite integrity check.
-
-### 3. Export a chat
-
-```bash
-python export_chat.py xxx
-python export_chat.py xxx -o chats/output.txt
-```
-
-Options:
-- `-o`, `--output` — output file path (default: `<contact>_chat.txt`)
-- `-d`, `--decrypted-dir` — custom path to decrypted databases
-
-The exporter:
-- Searches across all `message_*.db` files (chats can span multiple DBs)
-- Resolves per-DB Name2Id rowid mappings correctly
-- Decompresses zstd-encoded messages (CT=4)
-- Formats message types: text, images, stickers, links, quotes, files, mini programs, system messages
-
-## Configuration
-
-On first run, create `config.json` (or edit the existing one):
-
-```json
-{
-    "db_dir": "/Users/YOU/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/YOUR_WXID/db_storage",
-    "keys_file": "all_keys.json",
-    "decrypted_dir": "decrypted",
-    "wechat_process": "WeChat"
-}
-```
-
-Find `db_dir` by browsing `~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/`.
-
-## Files
-
-| File | Purpose |
-|------|---------|
-| `find_all_keys_macos.c` | C — scans WeChat process memory for SQLCipher keys (Mach VM API) |
-| `decrypt_db.py` | Decrypts all databases using extracted keys |
-| `export_chat.py` | Exports a 1-on-1 chat to a text file |
-| `config.py` | Config loader |
-| `config.json` | Your local configuration |
-| `requirements.txt` | Python dependencies |
-
-## Acknowledgments
-
-Inspired by [wechat-decrypt](https://github.com/ylytdeng/wechat-decrypt) by [@ylytdeng](https://github.com/ylytdeng).
-
-## Disclaimer
-
-This tool is for personal use only — to access **your own** WeChat data on your own machine. Respect applicable laws and do not use it for unauthorized data access.
-
----
-
 # 微信 macOS 数据库解密 & 聊天记录导出
+
+[English](README_EN.md)
 
 我们的数据，我们做主！解密微信 4.x (macOS) 本地 SQLCipher 4 加密数据库，导出聊天记录为可读文本文件。
 
@@ -121,7 +18,7 @@ WCDB（微信的 SQLCipher 封装层）会在进程内存中缓存派生后的�
 
 ## 环境要求
 
-- macOS (Apple Silicon / Intel)
+- **macOS** (Apple Silicon / Intel)
 - 微信 4.x 正在运行且已登录
 - Xcode 命令行工具: `xcode-select --install`
 - Python 3.10+，安装依赖: `pip install -r requirements.txt`
@@ -158,15 +55,23 @@ python decrypt_db.py
 ### 3. 导出聊天记录
 
 ```bash
-python export_chat.py xxx
+# 模糊搜索联系人（支持部分匹配，多个结果时交互选择）
+python export_chat.py ning
+
+# 指定输出文件
 python export_chat.py xxx -o chats/output.txt
+
+# 增量导出（输出到 export/<联系人>/output_0.txt, output_1.txt, ...）
+python export_chat.py xxx -i
 ```
 
 参数：
-- `-o`, `--output` — 输出文件路径（默认: `<联系人备注>_chat.txt`）
+- `-o`, `--output` — 输出文件路径（默认: `export/<联系人备注>_chat.txt`）
 - `-d`, `--decrypted-dir` — 自定义解密数据库目录路径
+- `-i`, `--incremental` — 增量导出，仅导出上次导出之后的新消息
 
 导出功能：
+- 支持联系人模糊搜索（大小写不敏感的部分匹配）
 - 自动搜索所有 `message_*.db`（聊天记录可能分布在多个数据库中）
 - 正确处理每个数据库独立的 Name2Id rowid 映射
 - 自动解压 zstd 压缩的消息（CT=4）
