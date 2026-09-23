@@ -30,3 +30,6 @@ find_all_keys_macos
 
 # Python virtualenv (created by setup.sh)
 venv
+
+# MCP server access log
+logs/
