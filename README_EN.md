@@ -79,7 +79,7 @@ The exporter:
 
 ## Configuration
 
-On first run, create `config.json` (or edit the existing one):
+No setup needed: on first run the WeChat data folder is auto-detected and saved to `config.json` (you pick one if there are multiple accounts). Your own WeChat ID is derived from the folder name. To override, edit `config.json`:
 
 ```json
 {

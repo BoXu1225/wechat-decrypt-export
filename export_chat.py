@@ -25,10 +25,12 @@ from datetime import datetime
 
 import zstandard
 
-# Default paths relative to this script's directory
+from config import load_config
+
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_DECRYPTED_DIR = os.path.join(PROJECT_ROOT, "decrypted")
-MY_WXID_PREFIX = "wxid_dsnzkc2lm38y22"
+_cfg = load_config()
+DEFAULT_DECRYPTED_DIR = _cfg["decrypted_dir"]
+MY_WXID = _cfg["self_wxid"]
 
 
 def decompress_if_needed(content, ct):
@@ -274,7 +276,7 @@ def export_chat(remark_name, output_file=None, decrypted_dir=None, incremental=F
         for rowid, username in name2id:
             if username == target_wxid:
                 target_rowid = rowid
-            if username.startswith(MY_WXID_PREFIX):
+            if username == MY_WXID:
                 my_rowid = rowid
 
         if target_rowid is None:

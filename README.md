@@ -79,7 +79,7 @@ python export_chat.py xxx -i
 
 ## 配置
 
-首次运行前，创建或编辑 `config.json`：
+无需手动配置：首次运行时会自动检测微信数据目录并生成 `config.json`（有多个账号时会让你选择）。你自己的微信 ID 会从目录名自动推导。如需手动指定，可编辑 `config.json`：
 
 ```json
 {
