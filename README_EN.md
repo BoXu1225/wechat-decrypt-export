@@ -27,7 +27,7 @@ After a WeChat update, install it to `/Applications` as usual and rerun `./setup
 `./wechat` runs `export_chat.py` with the project's venv from any directory (you can symlink it into `~/bin`). Each run automatically:
 
 1. **Extracts keys** when needed — on first run, when WeChat creates a new database, or when a key goes stale. This runs the scanner with `sudo` (asks for your password; WeChat must be open). Otherwise it's skipped.
-2. **Decrypts** only the databases that changed since last time, into `decrypted/`, checking HMAC and SQLite integrity.
+2. **Decrypts** only the databases that changed since last time (the `.db` or its `-wal`), into `decrypted/`, checking HMAC and SQLite integrity. Recent messages WeChat still holds in the `-wal` file (not yet checkpointed) are merged in.
 3. **Exports**.
 
 Decrypt on its own with `./wechat decrypt`.
