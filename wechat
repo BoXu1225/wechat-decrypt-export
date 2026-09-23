@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# wechat - run export_chat.py (or `wechat decrypt` -> decrypt_db.py) with the repo's venv,
+# from any directory. Can be symlinked into e.g. ~/bin.
+set -euo pipefail
+
+src="${BASH_SOURCE[0]}"
+while [[ -L "$src" ]]; do  # follow symlinks to find the repo
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" == /* ]] || src="$dir/$src"
+done
+ROOT="$(cd -P "$(dirname "$src")" && pwd)"
+
+PY="$ROOT/venv/bin/python"
+if [[ ! -x "$PY" ]]; then
+    echo "[!] 未找到虚拟环境，请先运行: $ROOT/setup.sh" >&2
+    exit 1
+fi
+
+if [[ "${1:-}" == "decrypt" ]]; then
+    shift
+    exec "$PY" "$ROOT/decrypt_db.py" "$@"
+fi
+exec "$PY" "$ROOT/export_chat.py" "$@"

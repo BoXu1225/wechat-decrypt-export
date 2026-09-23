@@ -207,6 +207,7 @@ def main():
 
     success = 0
     skipped = 0
+    no_key = 0
     failed = 0
     total_bytes = 0
 
@@ -214,8 +215,9 @@ def main():
         # 统一用正斜杠查找key
         rel_key = rel.replace('\\', '/')
         if rel_key not in keys:
+            # 微信从未打开过的库（如 migrate/unspportmsg.db）内存里没有密钥，不算失败
             print(f"SKIP: {rel} (无密钥)")
-            failed += 1
+            no_key += 1
             continue
 
         enc_key = bytes.fromhex(keys[rel_key]["enc_key"])
@@ -250,7 +252,7 @@ def main():
             failed += 1
 
     print(f"\n{'='*60}")
-    print(f"结果: {success} 成功, {skipped} 跳过(未变化), {failed} 失败, 共 {len(db_files)} 个")
+    print(f"结果: {success} 成功, {skipped} 跳过(未变化), {no_key} 跳过(无密钥), {failed} 失败, 共 {len(db_files)} 个")
     if total_bytes > 0:
         print(f"本次解密: {total_bytes/1024/1024/1024:.1f}GB")
     print(f"解密文件在: {OUT_DIR}")
