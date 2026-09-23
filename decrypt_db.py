@@ -36,7 +36,7 @@ STATE_FILE = ".decrypt_state.json"
 # 源文件在解密过程中被修改（微信正在 checkpoint）时的重试次数
 SNAPSHOT_RETRIES = 5
 
-from config import load_config
+from config import load_config, private_dir, private_opener, secure_outputs, write_private
 _cfg = load_config()
 DB_DIR = _cfg["db_dir"]
 OUT_DIR = _cfg["decrypted_dir"]
@@ -107,8 +107,7 @@ def ensure_keys():
         if rel not in new_keys and os.path.exists(os.path.join(DB_DIR, rel)) \
                 and key_is_valid(rel, entry["enc_key"]):
             new_keys[rel] = entry
-    with open(KEYS_FILE, "w") as f:
-        json.dump(new_keys, f, indent=2)
+    write_private(KEYS_FILE, json.dumps(new_keys, indent=2))
     return new_keys
 
 
@@ -259,12 +258,8 @@ def save_state(out_dir, updates):
         return
     state = load_state(out_dir)
     state.update({rel: {"db": sig["db"], "wal": sig["wal"]} for rel, sig in updates.items()})
-    os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, STATE_FILE)
-    tmp = f"{path}.{os.getpid()}.tmp"
-    with open(tmp, "w") as f:
-        json.dump(state, f, indent=1, sort_keys=True)
-    os.replace(tmp, path)
+    private_dir(out_dir)
+    write_private(os.path.join(out_dir, STATE_FILE), json.dumps(state, indent=1, sort_keys=True))
 
 
 def is_current(state, rel, db_path, out_path):
@@ -310,7 +305,7 @@ def _decrypt_snapshot(db_path, out_path, enc_key):
     print(msg)
 
     missing = 0
-    with open(db_path, 'rb') as fin, open(out_path, 'wb') as fout:
+    with open(db_path, 'rb') as fin, open(out_path, 'wb', opener=private_opener) as fout:
         for pgno in range(1, total_pages + 1):
             page = fin.read(PAGE_SZ) if pgno <= main_pages else b''
             if pgno in wal_pages:
@@ -348,7 +343,8 @@ def decrypt_database(db_path, out_path, enc_key):
     checkpoint）就重试。-wal 在读主文件之前一次性读入，只追加新帧不影响已读到的
     快照；读到写了一半的帧会因校验失败被截断。
     成功返回解密前的 source_sig（真值，供 save_state 记录），失败返回 False。"""
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    if os.path.dirname(out_path):
+        private_dir(os.path.dirname(out_path))
     tmp = out_path + ".tmp"
     try:
         for _ in range(SNAPSHOT_RETRIES):
@@ -376,11 +372,12 @@ def main():
     print("=" * 60)
     print("  WeChat 4.0 数据库解密器")
     print("=" * 60)
+    secure_outputs(_cfg)
 
     keys = ensure_keys()
     print(f"\n[+] 加载 {len(keys)} 个数据库密钥")
     print(f"[+] 输出目录: {OUT_DIR}")
-    os.makedirs(OUT_DIR, exist_ok=True)
+    private_dir(OUT_DIR)
 
     # 收集所有DB文件
     db_files = []

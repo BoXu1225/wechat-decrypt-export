@@ -6,9 +6,11 @@ import glob
 import json
 import os
 import re
+import stat
 import sys
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(PROJECT_ROOT, "config.json")
 
 _DEFAULT_TEMPLATE_DIR = "/Users/YOU/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/YOUR_WXID/db_storage"
 
@@ -79,13 +81,11 @@ def load_config():
             print(f"[+] 自动检测到微信数据目录: {detected}")
             # 合并默认值并保存
             cfg = {**_DEFAULT, **cfg, "db_dir": detected}
-            with open(CONFIG_FILE, "w") as f:
-                json.dump(cfg, f, indent=4, ensure_ascii=False)
+            write_private(CONFIG_FILE, json.dumps(cfg, indent=4, ensure_ascii=False))
             print(f"[+] 已保存到: {CONFIG_FILE}")
         else:
             if not os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, "w") as f:
-                    json.dump(_DEFAULT, f, indent=4)
+                write_private(CONFIG_FILE, json.dumps(_DEFAULT, indent=4))
             print(f"[!] 未能自动检测微信数据目录")
             print(f"    请手动编辑 {CONFIG_FILE} 中的 db_dir 字段")
             print(f"    路径位于 {_XWECHAT_FILES}/<你的微信ID>/db_storage")
@@ -110,3 +110,125 @@ def load_config():
         cfg["decoded_image_dir"] = os.path.join(base, "decoded_images")
 
     return cfg
+
+
+# ---------------------------------------------------------------------------
+# 文件权限：解密出的数据库、密钥、配置、日志、导出的聊天记录都只允许本人读写
+# （目录 0700，文件 0600），其他本地用户不可读。
+# ---------------------------------------------------------------------------
+
+PRIVATE_UMASK = 0o077
+
+
+def private_opener(path, flags):
+    """open(..., opener=private_opener)：新建的文件为 0600（已存在的文件权限不变）"""
+    return os.open(path, flags, 0o600)
+
+
+def chmod_private(path):
+    """去掉 group/other 的权限位（0644 -> 0600，0755 -> 0700）；不跟随符号链接，
+    只处理自己拥有的文件。权限有变化时返回 True"""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(st.st_mode) or st.st_uid != os.getuid() or not st.st_mode & 0o077:
+        return False
+    os.chmod(path, stat.S_IMODE(st.st_mode) & ~0o077)
+    return True
+
+
+def private_dir(path):
+    """创建目录（连同缺失的上级目录都是 0700），已存在则收紧为 0700；返回 path"""
+    old = os.umask(PRIVATE_UMASK)   # makedirs 的 mode 只作用于最后一级
+    try:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+    finally:
+        os.umask(old)
+    chmod_private(path)
+    return path
+
+
+def write_private(path, text):
+    """原子写入文本文件，权限 0600（替换后的文件属于当前用户）"""
+    path = os.path.realpath(path)   # path 是符号链接时写入其目标
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8", opener=private_opener) as f:
+            f.write(text)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def tighten_tree(path):
+    """收紧 path（文件或目录树）的权限。只有顶层权限过宽时才遍历整棵树，
+    所以已处理过的目录每次只需一次 stat。返回修改的条目数"""
+    if not chmod_private(path):
+        return 0
+    n = 1
+    if os.path.isdir(path) and not os.path.islink(path):
+        for root, dirs, files in os.walk(path):
+            for name in dirs + files:
+                n += chmod_private(os.path.join(root, name))
+    return n
+
+
+def _is_wechat_path(path, cfg):
+    """微信自己的数据目录（绝不修改其权限）"""
+    real = os.path.realpath(path)
+    roots = [os.path.dirname(_XWECHAT_FILES)]   # .../com.tencent.xinWeChat/Data/Documents
+    roots += [cfg[k] for k in ("db_dir", "wechat_base_dir") if cfg.get(k)]
+    for r in roots:
+        r = os.path.realpath(r)
+        if real == r or real.startswith(r.rstrip(os.sep) + os.sep):
+            return True
+    return False
+
+
+def output_paths(cfg=None):
+    """本工具写出的路径（相对路径以项目目录为基准）：[(path, 是否目录树)]"""
+    cfg = cfg or {}
+
+    def resolve(p):
+        return p if os.path.isabs(p) else os.path.join(PROJECT_ROOT, p)
+
+    paths = [(CONFIG_FILE, False),
+             (os.path.join(PROJECT_ROOT, "export"), True),
+             (os.path.join(PROJECT_ROOT, "logs"), True)]
+    for key in ("keys_file", "mcp_access_log"):
+        if cfg.get(key):
+            paths.append((resolve(cfg[key]), False))
+    for key in ("decrypted_dir", "decoded_image_dir"):
+        if cfg.get(key):
+            paths.append((resolve(cfg[key]), True))
+    idx = cfg.get("mcp_index_path")
+    if idx:
+        paths += [(resolve(idx) + s, False) for s in ("", "-wal", "-shm")]
+    return paths
+
+
+def secure_outputs(cfg=None):
+    """入口调用一次：设置 umask 0o077（此后新建的文件/目录只有本人可访问），
+    并收紧已有输出路径的权限（旧版本创建的 0755/0644）。
+    不处理微信自己的目录，也不处理项目目录本身或其上级目录。返回修改的条目数"""
+    os.umask(PRIVATE_UMASK)
+    cfg = cfg or {}
+    root = os.path.realpath(PROJECT_ROOT)
+    home = os.path.realpath(os.path.expanduser("~"))
+    n = 0
+    for path, tree in output_paths(cfg):
+        real = os.path.realpath(path)
+        if (real == home or root == real or root.startswith(real.rstrip(os.sep) + os.sep)
+                or _is_wechat_path(path, cfg)):
+            continue
+        try:
+            n += tighten_tree(path) if tree else chmod_private(path)
+        except OSError as e:
+            print(f"[!] 无法修改权限 {path}: {e}", file=sys.stderr)
+    if n:
+        print(f"[+] 已将 {n} 个输出文件/目录的权限收紧为仅本人可访问（目录 700，文件 600）",
+              file=sys.stderr)
+    return n
