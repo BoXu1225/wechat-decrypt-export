@@ -24,6 +24,7 @@ DAVE = "wxid_dave"        # stranger (group member)
 ROOM = "12345@chatroom"
 OFFICIAL = "gh_news"
 FILEHELPER = "filehelper"
+IMAGE_MD5 = "0123456789abcdef0123456789abcdef"
 
 MSG_SCHEMA = """(local_id INTEGER PRIMARY KEY AUTOINCREMENT, server_id INTEGER,
     local_type INTEGER, sort_seq INTEGER, real_sender_id INTEGER, create_time INTEGER,
@@ -173,6 +174,10 @@ class Fixture:
         # A table whose hash matches no known user must be ignored.
         conn.execute(f"CREATE TABLE {tbl('nobody')}{MSG_SCHEMA}")
         conn.execute(f"INSERT INTO {tbl('nobody')}(local_type, create_time) VALUES (1, 1)")
+        # Image rows carry the file md5 in packed_info_data (protobuf string).
+        for username, _ in chats_rows:
+            conn.execute(f"UPDATE {tbl(username)} SET packed_info_data = ? WHERE local_type = 3",
+                         (b"\x12\x20" + IMAGE_MD5.encode(),))
         conn.commit()
         conn.close()
         self.dbs[n] = path
@@ -287,6 +292,16 @@ class ChatsTest(unittest.TestCase):
         self.assertEqual(r["server_id"], 2000)
         self.assertEqual(r["local_type"], 1)
         self.assertEqual(recs[5]["local_type"], 49 | (57 << 32))
+
+    def test_iter_messages_packed_info(self):
+        recs = list(chats.iter_messages(self.by_user[ALICE], self.dir, SELF, self.contacts,
+                                        with_packed_info=True))
+        img = [r for r in recs if r["kind"] == "image"]
+        self.assertEqual(len(img), 1)
+        self.assertIn(IMAGE_MD5.encode(), img[0]["packed_info_data"])
+        self.assertTrue(all("packed_info_data" not in r for r in recs if r["kind"] != "image"))
+        # Off by default.
+        self.assertTrue(all("packed_info_data" not in r for r in self.msgs(ALICE)))
 
     def test_iter_messages_group(self):
         got = [(r["ts"], r["sender"], r["is_self"], r["kind"], r["text"])
