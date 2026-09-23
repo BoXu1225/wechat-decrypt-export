@@ -711,7 +711,7 @@ def main(argv=None, cfg=None):
             print(f"[!] 没有找到作者: {args.name}")
             return 1
         names = {p["username"]: p["author"] for p in posts}
-        print(f"[+] 作者: " + "、".join(names.get(u, u) for u in authors))
+        print("[+] 作者: " + "、".join(names.get(u, u) for u in authors))
         stem = f"moments_{S.safe_filename(args.name)}"
     posts = filter_posts(posts, authors, args.query, since, until)
     path = S.output_path(export_dir, stem, args.format, args.output)

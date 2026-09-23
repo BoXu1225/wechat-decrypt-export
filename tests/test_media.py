@@ -351,7 +351,7 @@ class ExportMediaTest(unittest.TestCase):
         self.addCleanup(p.stop)
         # voice with a server id and stored audio, voice without stored audio,
         # a downloaded video, and a video with only its thumbnail.
-        self.v1 = self.add_msg(34, ALICE, 210, f'<msg><voicemsg voicelength="2400" /></msg>',
+        self.v1 = self.add_msg(34, ALICE, 210, '<msg><voicemsg voicelength="2400" /></msg>',
                                server_id=4242)
         self.add_msg(34, SELF, 211, '<msg><voicemsg voicelength="5000" /></msg>', server_id=4343)
         self.add_msg(43, ALICE, 212, '<msg><videomsg playlength = "35" /></msg>',

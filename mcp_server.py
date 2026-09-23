@@ -1348,7 +1348,6 @@ def favorites_search(data, query=None, type=None, since=None, until=None, limit=
 
 
 def favorite_get(data, id):
-    import favorites as FV
     try:
         fid = int(str(id).strip())
     except (TypeError, ValueError):

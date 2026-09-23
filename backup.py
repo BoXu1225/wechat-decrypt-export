@@ -647,7 +647,7 @@ def status(cfg):
             info = launchd_info()
             print(f"  已加载: {'是' if info is not None else '否（请重新运行 ./wechat backup --install）'}")
             if info:
-                print(f"  launchd: " + ", ".join(f"{k}={v}" for k, v in info.items()))
+                print("  launchd: " + ", ".join(f"{k}={v}" for k, v in info.items()))
             print(f"  每天 {h:02d}:{m:02d}，下次运行: {next_run(h, m):%Y-%m-%d %H:%M}")
             print(f"  导出目录: {d}")
             if (h, m) != (cfg["hour"], cfg["minute"]):
