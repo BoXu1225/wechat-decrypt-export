@@ -277,63 +277,24 @@ def check_rate_limit(log, limits, now):
 # Post-send verification (decrypted DB)
 # ---------------------------------------------------------------------------
 
-WAL_HDR = 32
-WAL_FRAME_HDR = 24
-
-
-def _apply_wal(wal_path, out_path, enc_key, decrypt_page, page_sz):
-    """Overlay committed frames of an encrypted WAL onto a decrypted DB.
-
-    Self-contained on purpose: when decrypt_db.py gains WAL support, replace
-    the call in refresh_message_dbs() with it and delete this function.
-
-    Only frames whose salts match the WAL header, up to the last commit frame,
-    are applied (SQLite's own validity rule, minus checksum verification).
-    """
-    if not os.path.exists(wal_path) or os.path.getsize(wal_path) <= WAL_HDR:
-        return 0
-    with open(wal_path, "rb") as f:
-        data = f.read()
-    if int.from_bytes(data[8:12], "big") != page_sz:
-        return 0
-    salt = data[16:24]
-    frames, pending = {}, {}
-    db_pages = None
-    off = WAL_HDR
-    step = WAL_FRAME_HDR + page_sz
-    while off + step <= len(data):
-        hdr = data[off:off + WAL_FRAME_HDR]
-        if hdr[8:16] != salt:
-            break
-        pgno = int.from_bytes(hdr[0:4], "big")
-        commit = int.from_bytes(hdr[4:8], "big")
-        pending[pgno] = off + WAL_FRAME_HDR
-        if commit:
-            frames.update(pending)
-            pending = {}
-            db_pages = commit
-        off += step
-    if not frames:
-        return 0
-    with open(out_path, "r+b") as out:
-        for pgno, poff in frames.items():
-            page = decrypt_page(enc_key, data[poff:poff + page_sz], pgno)
-            out.seek((pgno - 1) * page_sz)
-            out.write(page)
-        if db_pages:
-            out.truncate(db_pages * page_sz)
-    return len(frames)
-
-
-def refresh_message_dbs(cfg):
-    """Re-decrypt changed message/message_N.db files (+ their WAL). No sudo.
-
-    Returns (ok, note). ok=False means keys are missing/stale; the caller
-    should skip verification.
-    """
+def _load_decrypt_db():
     with contextlib.redirect_stdout(sys.stderr):
-        import decrypt_db as D
-        keys = D.load_keys()
+        import decrypt_db
+    return decrypt_db
+
+
+def refresh_message_dbs(cfg, dd=None):
+    """Re-decrypt changed message/message_N.db files with existing keys.
+
+    Uses decrypt_db's incremental decrypt (merges committed -wal frames,
+    tracks .db/-wal changes in decrypted/.decrypt_state.json). Never runs
+    sudo; all output goes to stderr.
+    Returns (ok, note). ok=False means keys are missing/stale or decryption
+    failed; the caller should report the send as unverified.
+    """
+    dd = dd or _load_decrypt_db()
+    with contextlib.redirect_stdout(sys.stderr):
+        keys = dd.load_keys()
     if not keys:
         return False, "no keys file; run ./wechat decrypt to enable verification"
     db_dir = cfg["db_dir"]
@@ -341,31 +302,27 @@ def refresh_message_dbs(cfg):
     msg_dir = os.path.join(db_dir, "message")
     if not os.path.isdir(msg_dir):
         return False, "message directory not found"
+    state = dd.load_state(out_dir)
     for f in sorted(os.listdir(msg_dir)):
         if not re.fullmatch(r"message_\d+\.db", f):
             continue
         rel = f"message/{f}"
         src = os.path.join(db_dir, rel)
-        wal = src + "-wal"
-        dst = os.path.join(out_dir, rel)
-        src_m = max(os.path.getmtime(src),
-                    os.path.getmtime(wal) if os.path.exists(wal) else 0)
-        if os.path.exists(dst) and os.path.getmtime(dst) >= src_m:
+        out = os.path.join(out_dir, rel)
+        if dd.is_current(state, rel, src, out):
             continue
         if rel not in keys:
             continue
         with contextlib.redirect_stdout(sys.stderr):
-            if not D.key_is_valid(rel, keys[rel]["enc_key"]):
-                return False, f"key for {rel} is stale; run ./wechat decrypt"
             enc_key = bytes.fromhex(keys[rel]["enc_key"])
-            tmp = dst + ".send_tmp"
-            if not D.decrypt_database(src, tmp, enc_key):
+            with open(src, "rb") as fh:
+                page1 = fh.read(dd.PAGE_SZ)
+            if len(page1) < dd.PAGE_SZ or not dd.page1_hmac_ok(page1, enc_key):
+                return False, f"key for {rel} is stale; run ./wechat decrypt"
+            sig = dd.decrypt_database(src, out, enc_key)  # atomic, includes -wal
+            if not sig:
                 return False, f"decrypt failed for {rel}"
-            try:
-                _apply_wal(wal, tmp, enc_key, D.decrypt_page, D.PAGE_SZ)
-            except OSError:
-                pass
-            os.replace(tmp, dst)
+            dd.save_state(out_dir, {rel: sig})
     return True, None
 
 

@@ -419,36 +419,82 @@ class FindSentTests(unittest.TestCase):
         self.assertIsNone(W.find_sent_message(chat, "x", 0, self.cfg, {}))
 
 
-class WalTests(unittest.TestCase):
-    PAGE = 64
+class FakeDecryptDb:
+    """Stands in for decrypt_db's incremental-decrypt API."""
+    PAGE_SZ = 16
 
-    def _frame(self, pgno, commit, salt, fill):
-        return (pgno.to_bytes(4, "big") + commit.to_bytes(4, "big") + salt + b"\0" * 8
-                + bytes([fill]) * self.PAGE)
+    def __init__(self, keys, key_ok=True, decrypt_ok=True):
+        self.keys, self.key_ok, self.decrypt_ok = keys, key_ok, decrypt_ok
+        self.decrypted, self.saved = [], {}
+        self.current = set()
 
-    def test_apply_committed_frames_only(self):
-        tmp = tempfile.mkdtemp()
-        try:
-            db = os.path.join(tmp, "x.db")
-            with open(db, "wb") as f:
-                f.write(b"\x01" * self.PAGE * 3)
-            salt = b"SALTSALT"
-            hdr = b"\x37\x7f\x06\x82" + b"\0" * 4 + self.PAGE.to_bytes(4, "big") \
-                + b"\0" * 4 + salt + b"\0" * 8
-            wal = hdr + self._frame(2, 0, salt, 0x22) + self._frame(4, 4, salt, 0x44) \
-                + self._frame(3, 0, salt, 0x33) \
-                + self._frame(1, 4, b"OLDSALT!", 0x55)
-            with open(db + "-wal", "wb") as f:
-                f.write(wal)
-            n = W._apply_wal(db + "-wal", db, b"k", lambda k, p, n: p, self.PAGE)
-            self.assertEqual(n, 2)
-            with open(db, "rb") as f:
-                data = f.read()
-            pages = [data[i:i + self.PAGE] for i in range(0, len(data), self.PAGE)]
-            self.assertEqual([p[0] for p in pages], [0x01, 0x22, 0x01, 0x44])
-        finally:
-            shutil.rmtree(tmp)
+    def load_keys(self):
+        print("noise on stdout")      # must be routed to stderr
+        return dict(self.keys)
 
+    def load_state(self, out_dir):
+        return {}
+
+    def is_current(self, state, rel, db_path, out_path):
+        return rel in self.current
+
+    def page1_hmac_ok(self, page1, enc_key):
+        return self.key_ok
+
+    def decrypt_database(self, src, out, enc_key):
+        self.decrypted.append(os.path.basename(src))
+        return {"db": [1, 1], "wal": None} if self.decrypt_ok else False
+
+    def save_state(self, out_dir, updates):
+        self.saved.update(updates)
+
+
+class RefreshTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        msg = os.path.join(self.tmp, "src", "message")
+        os.makedirs(msg)
+        for f in ("message_0.db", "message_1.db", "message_fts.db", "message_0.db-wal"):
+            with open(os.path.join(msg, f), "wb") as fh:
+                fh.write(b"x" * 16)
+        self.cfg = {"db_dir": os.path.join(self.tmp, "src"),
+                    "decrypted_dir": os.path.join(self.tmp, "out")}
+        self.keys = {"message/message_0.db": {"enc_key": "00" * 32},
+                     "message/message_1.db": {"enc_key": "00" * 32}}
+
+    def run_refresh(self, dd):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            res = W.refresh_message_dbs(self.cfg, dd=dd)
+        self.assertEqual(out.getvalue(), "")   # nothing on stdout (MCP-safe)
+        return res
+
+    def test_decrypts_changed_message_dbs_only(self):
+        dd = FakeDecryptDb(self.keys)
+        dd.current = {"message/message_1.db"}
+        self.assertEqual(self.run_refresh(dd), (True, None))
+        self.assertEqual(dd.decrypted, ["message_0.db"])
+        self.assertEqual(list(dd.saved), ["message/message_0.db"])
+
+    def test_no_keys(self):
+        ok, note = self.run_refresh(FakeDecryptDb({}))
+        self.assertFalse(ok)
+        self.assertIn("keys", note)
+
+    def test_stale_key(self):
+        dd = FakeDecryptDb(self.keys, key_ok=False)
+        ok, note = self.run_refresh(dd)
+        self.assertFalse(ok)
+        self.assertIn("stale", note)
+        self.assertEqual(dd.decrypted, [])
+
+    def test_decrypt_failure(self):
+        ok, note = self.run_refresh(FakeDecryptDb(self.keys, decrypt_ok=False))
+        self.assertFalse(ok)
+        self.assertIn("decrypt failed", note)
 
 class FakeHelperServer:
     """Unix-socket server speaking the helper protocol from a handler table."""
