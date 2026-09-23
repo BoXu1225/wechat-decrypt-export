@@ -91,7 +91,7 @@
 - 只在失败或需要手动提取密钥时发送 macOS 通知；成功时不打扰。有锁文件，不会重叠运行。
 - 退出码：0 成功，1 失败，2 配置错误，3 已有备份在运行，4 完成但有数据库需要新密钥。
 - 定时任务是 LaunchAgent（`~/Library/LaunchAgents/local.wechat-decrypt-export.backup.plist`），以低优先级运行；屏幕锁定时照常运行（只读写文件）。到点时电脑在睡眠，会在**唤醒后补跑**一次（错过多次也只补一次）；关机或未登录时不运行。
-- **权限**：由 launchd 启动时，macOS 要求单独授权读取微信的数据（终端的授权不适用）。请在 系统设置 > 隐私与安全性 > **完全磁盘访问权限** 中添加 `--install` 打印的 Python 路径（Homebrew 升级 Python 后需重新添加），然后用 `launchctl kickstart gui/$(id -u)/local.wechat-decrypt-export.backup` 试运行、`./wechat backup --status` 查看结果。没有权限时备份不会卡在授权弹窗上：约 45 秒后放弃解密，只导出已解密的数据，并发送通知。
+- **权限**：由 launchd 启动时，macOS 要求单独授权读取微信的数据（终端的授权不适用）。定时任务通过 `~/Applications/WeChatBackup.app` 启动（`--install` 自动构建安装；这是一个极小的 ad-hoc 签名启动器，仓库路径编译在里面，只能以子进程运行本仓库的 `backup.py`），macOS 把访问归属到它，所以**只需为 WeChatBackup.app 授权**，不要为 Python 或终端授权：系统设置 > 隐私与安全性 > **完全磁盘访问权限** > 点「+」> 按 ⌘⇧G 输入 `~/Applications/WeChatBackup.app` > 打开，并确认开关已打开。然后用 `launchctl kickstart gui/$(id -u)/local.wechat-decrypt-export.backup` 试运行、`./wechat backup --status` 查看结果。重复 `--install` 时只有启动器源码或仓库路径变化才会重新构建（重新构建后需删除旧条目并重新授权）。没有权限时备份不会卡在授权弹窗上：约 45 秒后放弃解密，只导出已解密的数据，并发送通知。
 
 ## 朋友圈与收藏
 
@@ -144,6 +144,7 @@ WCDB（微信的 SQLCipher 封装层）会在进程内存中缓存派生后的�
 | `find_all_keys_macos.c` | C 源码 — 通过 Mach VM API 扫描微信进程内存提取 SQLCipher 密钥 |
 | `decrypt_db.py` | 解密有变化的数据库；密钥缺失或过期时自动提取 |
 | `backup.py` | 无人值守备份（`./wechat backup`）与定时任务安装 |
+| `launcher/` | 定时备份的启动器 WeChatBackup.app（C，ad-hoc 签名；完全磁盘访问权限只授予它） |
 | `export_chat.py` | 命令行：搜索、列出、导出 |
 | `chats.py` | 聊天发现、联系人、群成员名称、消息解析 |
 | `formatters.py` | txt / md / html / json / csv 输出 |

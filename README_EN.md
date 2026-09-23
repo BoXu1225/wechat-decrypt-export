@@ -91,7 +91,7 @@ What the exporter handles:
 - macOS notification only on failure or when keys need a manual `./wechat decrypt`. A lock file prevents overlapping runs.
 - Exit codes: 0 ok, 1 failed, 2 config error, 3 another run in progress, 4 done but some DBs need new keys.
 - Low-priority LaunchAgent (`~/Library/LaunchAgents/local.wechat-decrypt-export.backup.plist`); runs while the screen is locked (files only). If the Mac is asleep at the scheduled time, launchd runs the job **once after wake** (missed runs are coalesced); it does not run while shut down or logged out.
-- **Permission**: when started by launchd, macOS requires its own grant to read WeChat's data (Terminal's grant does not apply). Add the Python path printed by `--install` under System Settings > Privacy & Security > **Full Disk Access** (again after a Homebrew Python upgrade), then test with `launchctl kickstart gui/$(id -u)/local.wechat-decrypt-export.backup` and `./wechat backup --status`. Without it the backup does not hang on the consent prompt: after ~45 s it skips decryption, exports the already-decrypted data and notifies you.
+- **Permission**: when started by launchd, macOS requires its own grant to read WeChat's data (Terminal's grant does not apply). The job is started through `~/Applications/WeChatBackup.app` (built and installed by `--install`: a tiny ad-hoc signed launcher with the repo path compiled in that can only run this repo's `backup.py` as a child process), and macOS attributes the access to it, so **grant only WeChatBackup.app**, not Python or Terminal: System Settings > Privacy & Security > **Full Disk Access** > + > press ⌘⇧G, enter `~/Applications/WeChatBackup.app` > Open, and make sure its switch is on. Then test with `launchctl kickstart gui/$(id -u)/local.wechat-decrypt-export.backup` and `./wechat backup --status`. Re-running `--install` rebuilds the app only when the launcher sources or the repo path change (after a rebuild, remove the old entry and add the app again). Without the grant the backup does not hang on the consent prompt: after ~45 s it skips decryption, exports the already-decrypted data and notifies you.
 
 ## Moments & Favorites
 
@@ -144,6 +144,7 @@ Each chat's messages live in tables named `Msg_<md5(username)>`; message content
 | `find_all_keys_macos.c` | C — scans WeChat process memory for SQLCipher keys (Mach VM API) |
 | `decrypt_db.py` | Decrypts changed databases; extracts keys automatically when missing or stale |
 | `backup.py` | Unattended backup (`./wechat backup`) and LaunchAgent install |
+| `launcher/` | WeChatBackup.app, the backup job's launcher (C, ad-hoc signed; the only thing granted Full Disk Access) |
 | `export_chat.py` | Command line: search, list, export |
 | `chats.py` | Chat discovery, contacts, group sender names, message parsing |
 | `formatters.py` | txt / md / html / json / csv writers |
