@@ -1,5 +1,7 @@
 # 微信 macOS 数据库解密 & 聊天记录导出
 
+[![CI](https://github.com/BoXu1225/wechat-decrypt-export/actions/workflows/ci.yml/badge.svg)](https://github.com/BoXu1225/wechat-decrypt-export/actions/workflows/ci.yml)
+
 [English](README_EN.md)
 
 我们的数据，我们做主！解密微信 4.x (macOS) 本地 SQLCipher 4 加密数据库，把单聊和群聊导出为 txt、Markdown、HTML、JSON 或 CSV，支持图片。
@@ -113,3 +115,7 @@ WCDB（微信的 SQLCipher 封装层）会在进程内存中缓存派生后的�
 ## 免责声明
 
 本工具仅供个人使用，用于在自己的电脑上访问**自己的**微信数据。请遵守相关法律法规，不要用于未经授权的数据访问。
+
+## 许可证
+
+[MIT](LICENSE)
