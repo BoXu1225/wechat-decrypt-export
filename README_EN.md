@@ -91,6 +91,21 @@ What the exporter handles:
 - Low-priority LaunchAgent (`~/Library/LaunchAgents/local.wechat-decrypt-export.backup.plist`); runs while the screen is locked (files only). If the Mac is asleep at the scheduled time, launchd runs the job **once after wake** (missed runs are coalesced); it does not run while shut down or logged out.
 - **Permission**: when started by launchd, macOS requires its own grant to read WeChat's data (Terminal's grant does not apply). Add the Python path printed by `--install` under System Settings > Privacy & Security > **Full Disk Access** (again after a Homebrew Python upgrade), then test with `launchctl kickstart gui/$(id -u)/local.wechat-decrypt-export.backup` and `./wechat backup --status`. Without it the backup does not hang on the consent prompt: after ~45 s it skips decryption, exports the already-decrypted data and notifies you.
 
+## Moments & Favorites
+
+```bash
+./wechat moments                         # all locally cached Moments posts -> export/moments.html
+./wechat moments 张三 --images            # one person's posts with cached photos/videos
+./wechat moments 我 -f md --since 2025-01-01
+./wechat favorites                       # all Favorites -> export/favorites.html
+./wechat favorites 发票 --type file -f json
+```
+
+Both take `-f html|md|json|txt` (default html), `--since` / `--until`, `--images`, `-o`, `--export-dir`, `--no-decrypt`. `moments` takes an optional author filter (remark / nickname / WeChat ID, partial; `我` = you) and `-q` text search; `favorites` takes an optional search query, `--type` and `--tag`. Output: `export/moments[_<name>].<ext>` / `export/favorites.<ext>`, media in a `_files/` folder next to it.
+
+- **Moments** (`sns/sns.db`) holds only posts WeChat has loaded on this Mac — your own and friends' posts you scrolled past — with text, links, location, likes and comments (names resolved through your contacts). Photos and videos are exported only when they are in WeChat's local cache (`cache/<month>/Sns/`); CDN URLs are kept in JSON but never downloaded.
+- **Favorites** (`favorite/favorite.db`): text, links, images, files, chat records, notes, locations, with source chat/sender and tags. Only files WeChat has saved locally can be exported.
+
 ## Configuration
 
 Nothing to configure: on first run the WeChat data folder is auto-detected and saved to `config.json` (you pick one if there are several accounts), and your own WeChat ID is derived from the folder name. To override, edit `config.json`:
@@ -123,13 +138,14 @@ Each chat's messages live in tables named `Msg_<md5(username)>`; message content
 | File | Purpose |
 |------|---------|
 | `setup.sh` | One-time environment setup (venv, scanner, WeChat signing) |
-| `wechat` | Launcher: `./wechat …` → export, `./wechat decrypt` → decrypt, `./wechat backup` → backup |
+| `wechat` | Launcher: `./wechat …` → export, `./wechat decrypt` → decrypt, `./wechat moments` / `favorites` → Moments / Favorites, `./wechat backup` → backup |
 | `find_all_keys_macos.c` | C — scans WeChat process memory for SQLCipher keys (Mach VM API) |
 | `decrypt_db.py` | Decrypts changed databases; extracts keys automatically when missing or stale |
 | `backup.py` | Unattended backup (`./wechat backup`) and LaunchAgent install |
 | `export_chat.py` | Command line: search, list, export |
 | `chats.py` | Chat discovery, contacts, group sender names, message parsing |
 | `formatters.py` | txt / md / html / json / csv writers |
+| `moments.py`, `favorites.py`, `social_common.py` | Moments / Favorites parsing, media lookup and export |
 | `image_decode.py` | Decodes WeChat `.dat` images and maps messages to image files |
 | `media_decode.py` | Voice (SILK → m4a) and video lookup; `--test N` checks decoding on your data |
 | `config.py` | Config loader and auto-detection |

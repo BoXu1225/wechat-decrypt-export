@@ -91,6 +91,21 @@
 - 定时任务是 LaunchAgent（`~/Library/LaunchAgents/local.wechat-decrypt-export.backup.plist`），以低优先级运行；屏幕锁定时照常运行（只读写文件）。到点时电脑在睡眠，会在**唤醒后补跑**一次（错过多次也只补一次）；关机或未登录时不运行。
 - **权限**：由 launchd 启动时，macOS 要求单独授权读取微信的数据（终端的授权不适用）。请在 系统设置 > 隐私与安全性 > **完全磁盘访问权限** 中添加 `--install` 打印的 Python 路径（Homebrew 升级 Python 后需重新添加），然后用 `launchctl kickstart gui/$(id -u)/local.wechat-decrypt-export.backup` 试运行、`./wechat backup --status` 查看结果。没有权限时备份不会卡在授权弹窗上：约 45 秒后放弃解密，只导出已解密的数据，并发送通知。
 
+## 朋友圈与收藏
+
+```bash
+./wechat moments                         # 本地缓存的全部朋友圈 -> export/moments.html
+./wechat moments 张三 --images            # 某人的朋友圈，附本地缓存的图片/视频
+./wechat moments 我 -f md --since 2025-01-01
+./wechat favorites                       # 全部收藏 -> export/favorites.html
+./wechat favorites 发票 --type file -f json
+```
+
+两者都支持 `-f html|md|json|txt`（默认 html）、`--since` / `--until`、`--images`、`-o`、`--export-dir`、`--no-decrypt`。`moments` 可按作者过滤（备注/昵称/微信号，部分匹配；`我` = 自己），`-q` 按内容搜索；`favorites` 可带搜索词、`--type` 和 `--tag`。输出为 `export/moments[_<名称>].<扩展名>` / `export/favorites.<扩展名>`，媒体文件在同名 `_files/` 目录。
+
+- **朋友圈**（`sns/sns.db`）只包含本机微信加载过的动态（自己的和刷到过的好友动态），含文字、链接、位置、点赞和评论（按通讯录显示名称）。图片/视频只有在微信本地缓存（`cache/<月份>/Sns/`）中时才能导出；CDN 链接保留在 JSON 中，不会联网下载。
+- **收藏**（`favorite/favorite.db`）：文字、链接、图片、文件、聊天记录、笔记、位置等，含来源聊天/发送者和标签。只有微信已保存在本地的文件能导出。
+
 ## 配置
 
 无需配置：首次运行时会自动检测微信数据目录并保存到 `config.json`（有多个账号时让你选择），你自己的微信 ID 从目录名自动推导。如需手动指定，编辑 `config.json`：
@@ -123,13 +138,14 @@ WCDB（微信的 SQLCipher 封装层）会在进程内存中缓存派生后的�
 | 文件 | 说明 |
 |------|------|
 | `setup.sh` | 一次性环境配置（venv、扫描器、微信签名） |
-| `wechat` | 启动脚本：`./wechat …` 导出，`./wechat decrypt` 解密，`./wechat backup` 备份 |
+| `wechat` | 启动脚本：`./wechat …` 导出，`./wechat decrypt` 解密，`./wechat moments` / `favorites` 朋友圈/收藏，`./wechat backup` 备份 |
 | `find_all_keys_macos.c` | C 源码 — 通过 Mach VM API 扫描微信进程内存提取 SQLCipher 密钥 |
 | `decrypt_db.py` | 解密有变化的数据库；密钥缺失或过期时自动提取 |
 | `backup.py` | 无人值守备份（`./wechat backup`）与定时任务安装 |
 | `export_chat.py` | 命令行：搜索、列出、导出 |
 | `chats.py` | 聊天发现、联系人、群成员名称、消息解析 |
 | `formatters.py` | txt / md / html / json / csv 输出 |
+| `moments.py`、`favorites.py`、`social_common.py` | 朋友圈 / 收藏解析、媒体查找和导出 |
 | `image_decode.py` | 解码微信 `.dat` 图片，并把消息对应到图片文件 |
 | `media_decode.py` | 语音（SILK → m4a）和视频查找；`--test N` 在你的数据上检查解码 |
 | `config.py` | 配置加载与自动检测 |
