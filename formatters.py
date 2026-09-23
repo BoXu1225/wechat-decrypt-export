@@ -137,6 +137,7 @@ main{max-width:760px;margin:0 auto;padding:8px 12px 32px}
 .self .bubble{background:var(--self);color:var(--selffg)}
 .bubble.img{padding:3px;background:transparent}
 .bubble img{display:block;max-width:100%;max-height:360px;border-radius:6px}
+.bubble.emoji img{max-width:120px;max-height:120px}
 .time{font-size:11px;color:var(--muted);margin:2px 6px 0}
 .sys{text-align:center;color:var(--muted);font-size:12px;margin:8px 0;white-space:pre-wrap}
 """
@@ -174,7 +175,8 @@ def write_html(records, meta, fp, base_dir=None, **_):
             parts.append(f"<div class=\"name\">{esc(r.get('sender') or '')}</div>")
         img = _img(r)
         if img:
-            parts.append(f"<div class=\"bubble img\"><img loading=\"lazy\" "
+            cls = "bubble img emoji" if r.get("kind") == "emoji" else "bubble img"
+            parts.append(f"<div class=\"{cls}\"><img loading=\"lazy\" "
                          f"src=\"{esc(_rel_image(img, base_dir))}\" alt=\"{esc(text)}\"></div>")
         else:
             parts.append(f"<div class=\"bubble\">{esc(text)}</div>")

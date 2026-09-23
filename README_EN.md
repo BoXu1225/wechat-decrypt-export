@@ -50,7 +50,8 @@ Decrypt on its own with `./wechat decrypt`.
 | `--all` | Incremental export of every chat |
 | `--list [filter]` | List chats |
 | `--type` | `all` (default), `single` (1-on-1), `group` |
-| `--images` | Decode images into `export/<name>_files/` and embed them in md/html/json (txt/csv show `[图片]`) |
+| `--images` | Decode images into `export/<name>_files/` and embed them in md/html/json (txt/csv show `[图片]`); cached stickers are shown too |
+| `--download-emoji` | With `--images`: download stickers that are not available locally from the WeChat CDN URL in the message (off by default; cached in `decrypted/emoji_cache/`) |
 | `--since` / `--until` | Date range, `YYYY-MM-DD`, inclusive |
 | `-o`, `--output` | Output file (default `export/<name>_chat.<ext>`) |
 | `--export-dir` | Export folder (default `export/`) |
@@ -61,7 +62,8 @@ What the exporter handles:
 - **Group chats**: each message shows the sender's group nickname, else your remark/their nickname
 - **Chats spanning several databases** (`message_0.db`, `message_1.db`, … — roughly one per year)
 - **Message types**: text, images, voice, video, stickers, links, files, quotes, mini programs, system messages; zstd-compressed messages are decompressed
-- **Images**: WeChat 4.x encrypted `.dat` images (including the HEVC-based wxgf format, converted to JPEG with macOS's built-in `sips`). The image key is derived from local account files — no extra `sudo` needed. When WeChat only has a thumbnail (full image never downloaded), the thumbnail is used and upgraded on a later export once the full image exists
+- **Images**: WeChat 4.x encrypted `.dat` images (including the HEVC-based wxgf format, converted to JPEG with macOS's built-in `sips`; wxgf images with an alpha channel become transparent PNGs). The image key is derived from local account files — no extra `sudo` needed. When WeChat only has a thumbnail (full image never downloaded), the thumbnail is used and upgraded on a later export once the full image exists
+- **Stickers**: WeChat's local sticker cache is encrypted (unknown key), so sticker images are fetched once with `--download-emoji` from the CDN URL in the message (WeChat CDN hosts only, with timeout and size limits; failures are not retried for a week). `./venv/bin/python emoticon.py` reports how many stickers are downloadable (counts only)
 - **Old incremental layout**: if you used the previous `export/<name>/output_N.txt` layout, the first incremental export merges those files into `export/<name>.txt`; the old folder can then be deleted
 
 ## Configuration

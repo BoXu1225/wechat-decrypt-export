@@ -46,7 +46,7 @@ _TIME_FMT = formatters.TIME_FMT
 # Markdown 增量状态（写在文件末尾的 HTML 注释，渲染时不可见；消息中的 "<" 已转义，无法伪造）
 _MD_STATE_RE = re.compile(r"^<!-- wechat-export: last=(\d+) n=(\d+) -->\s*$")
 # 记录中不写入输出文件的内部字段
-_INTERNAL_KEYS = ("packed_info_data",)
+_INTERNAL_KEYS = ("packed_info_data", "emoji_xml")
 
 
 @functools.lru_cache(maxsize=None)
@@ -330,11 +330,28 @@ class ImageExporter:
     已解码的文件直接复用（增量友好）；只有缩略图时保存为 <md5>_t.<扩展名>，
     以后原图下载到本地会再解码原图。"""
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, download_emoji=False, decrypted_dir=None):
         self.cfg = cfg
         self.base_dir = cfg.get("wechat_base_dir") or ""
         self._keys = None
         self.decoded = self.thumb = self.existing = self.missing = self.failed = 0
+        import emoticon
+        self.emoji = emoticon.EmojiResolver(decrypted_dir or cfg.get("decrypted_dir") or "",
+                                            self.base_dir,
+                                            download=download_emoji)
+        self.emoji_found = self.emoji_missing = 0
+
+    def attach_emoji(self, r, files_dir):
+        """表情（贴纸）：emoji_cache / 本地缓存 / （--download-emoji）下载，复制到 _files/。"""
+        import emoticon
+        info = emoticon.parse_emoji_xml(r.get("emoji_xml"))
+        existing = info and emoticon.existing_export_file(files_dir, info["md5"])
+        src = existing or (info and self.emoji.resolve(info))
+        if src:
+            r["image_path"] = existing or emoticon.export_file(src, files_dir, info["md5"])
+            self.emoji_found += 1
+        else:
+            self.emoji_missing += 1
 
     def keys(self):
         if self._keys is None:
@@ -361,8 +378,14 @@ class ImageExporter:
     @classmethod
     def attach_existing(cls, records, files_dir):
         """只引用已解码的图片（未指定 --images 时，保持之前导出的图片引用）。"""
+        import emoticon
         import image_decode
         for r in records:
+            if r.get("kind") == "emoji":
+                info = emoticon.parse_emoji_xml(r.get("emoji_xml"))
+                p = info and emoticon.existing_export_file(files_dir, info["md5"])
+                if p:
+                    r["image_path"] = p
             if r.get("kind") == "image":
                 md5 = image_decode.image_md5_from_packed_info(r.get("packed_info_data"))
                 if md5:
@@ -374,6 +397,9 @@ class ImageExporter:
         """为 records 中的图片消息设置 image_path（就地修改）。"""
         import image_decode
         for r in records:
+            if r.get("kind") == "emoji":
+                self.attach_emoji(r, files_dir)
+                continue
             if r.get("kind") != "image":
                 continue
             md5 = image_decode.image_md5_from_packed_info(r.get("packed_info_data"))
@@ -417,6 +443,13 @@ class ImageExporter:
                 self.thumb += 1
 
     def summary(self):
+        if self.emoji_found or self.emoji_missing:
+            st = self.emoji.stats
+            print(f"[+] 表情: 导出 {self.emoji_found}，缺失 {self.emoji_missing}"
+                  f"（新下载 {st['downloaded']}，下载失败 {st['failed'] + st['skipped_failed']}）")
+            if self.emoji_missing and not self.emoji.download:
+                print("[!] 微信本地的表情缓存是加密的，无法直接使用；"
+                      "加 --download-emoji 可从消息中的 CDN 地址下载（缓存到 decrypted/emoji_cache/）")
         total = self.decoded + self.existing + self.missing + self.failed
         if not total:
             return
@@ -658,6 +691,8 @@ def build_parser():
                         help="聊天类型过滤: all / single（单聊）/ group（群聊），默认 all")
     parser.add_argument("--images", action="store_true",
                         help="解码图片到 export/<名称>_files/，md/html/json 中直接引用（txt/csv 仍显示 [图片]）")
+    parser.add_argument("--download-emoji", action="store_true",
+                        help="配合 --images：本地没有的表情从消息中的 CDN 地址下载（默认关闭）")
     parser.add_argument("--since", type=_parse_date, metavar="YYYY-MM-DD",
                         help="只导出该日期（含）之后的消息")
     parser.add_argument("--until", type=_parse_date, metavar="YYYY-MM-DD",
@@ -675,6 +710,8 @@ def main(argv=None):
         parser.error("请指定联系人，或使用 --list / --all")
     if args.all and args.output:
         parser.error("--all 不能与 -o 同时使用（请用 --export-dir）")
+    if args.download_emoji and not args.images:
+        parser.error("--download-emoji 需要与 --images 一起使用")
 
     since = args.since.timestamp() if args.since else None
     until = (args.until + timedelta(days=1)).timestamp() if args.until else None
@@ -693,7 +730,8 @@ def main(argv=None):
         print(f"[!] 未找到消息数据库目录: {os.path.join(decrypted_dir, 'message')}")
         return 1
     src = ChatSource(decrypted_dir, cfg["self_wxid"])
-    images = ImageExporter(cfg) if args.images else None
+    images = (ImageExporter(cfg, download_emoji=args.download_emoji, decrypted_dir=decrypted_dir)
+              if args.images else None)
     if images is not None and args.format in ("txt", "csv") and args.list_filter is None:
         print(f"[!] {args.format} 格式不嵌入图片，图片只保存到 <名称>_files/ 目录")
 

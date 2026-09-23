@@ -554,7 +554,8 @@ def iter_messages(chat, decrypted_dir, self_wxid, contacts, group_nicknames=None
     Record: {ts, sender, is_self, kind, text, local_type, local_id,
              server_id, create_time}
     with_packed_info=True adds "packed_info_data" (bytes or None) to image
-    records (kind "image"); it holds the image file md5 (see image_decode).
+    records (kind "image"); it holds the image file md5 (see image_decode),
+    and "emoji_xml" (the raw <emoji .../> content) to sticker records.
     Messages whose formatted text is None are dropped.
     decrypted_dir is accepted for API symmetry (and group nicknames);
     table locations come from chat["tables"].
@@ -634,6 +635,8 @@ def iter_messages(chat, decrypted_dir, self_wxid, contacts, group_nicknames=None
             }
             if with_packed_info and rec["kind"] == "image":
                 rec["packed_info_data"] = bytes(packed) if packed is not None else None
+            elif with_packed_info and rec["kind"] == "emoji":
+                rec["emoji_xml"] = text  # <emoji md5= cdnurl= ...>, see emoticon.py
             records.append((create_time or 0, sort_seq or 0, rec))
 
     # Stable sort keeps DB order (oldest DB first) for equal keys.
