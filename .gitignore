@@ -31,5 +31,5 @@ find_all_keys_macos
 # Python virtualenv (created by setup.sh)
 venv
 
-# MCP server access log
+# MCP server access log, wechat_send.py send log
 logs/

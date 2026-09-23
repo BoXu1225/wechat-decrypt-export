@@ -13,11 +13,15 @@ CLI:
     python wechat_send.py --check          # permission / WeChat state
     python wechat_send.py --probe          # dump WeChat's AX tree (text redacted)
 
-Requirements
-  - macOS Accessibility permission for the process that runs Python
-    (System Settings -> Privacy & Security -> Accessibility). Over SSH that is
-    /usr/libexec/sshd-keygen-wrapper; in a terminal it is the terminal app.
-  - pyobjc-framework-ApplicationServices / -Quartz / -Cocoa.
+Drivers ("send_driver" in config.json)
+  - "helper" (default): WeChatSendHelper.app, a small Swift LaunchAgent that
+    performs the UI primitives and is the only thing that needs the macOS
+    Accessibility permission (install: helper/install.sh). Works from SSH,
+    MCP servers, cron, etc. Socket: ~/Library/Application Support/
+    wechat-decrypt-export/sendhelper.sock (0600, same-uid peers only).
+  - "direct": pyobjc in this process; needs Accessibility for whatever runs
+    python (terminal app; over SSH /usr/libexec/sshd-keygen-wrapper) and
+    pyobjc-framework-ApplicationServices / -Quartz / -Cocoa.
 
 Safety model
   - The chat must resolve to exactly one contact/group (exact username or exact
@@ -31,7 +35,8 @@ Config (config.json, all optional):
     "send_rate_limit": {"min_interval_s": 3, "max_per_minute": 6},
     "send_max_chars": 2000,
     "send_key": "enter"            # or "cmd_enter" if WeChat is set to Cmd+Enter
-    "send_log": "logs/send_log.jsonl"
+    "send_log": "logs/send_log.jsonl",
+    "send_driver": "helper"        # or "direct"
 """
 import argparse
 import contextlib
@@ -107,6 +112,10 @@ class WeChatNotRunning(SendError):
 
 class ScreenLocked(SendError):
     code = "screen_locked"
+
+
+class HelperUnavailable(SendError):
+    code = "helper_unavailable"
 
 
 class UIError(SendError):
@@ -275,6 +284,9 @@ WAL_FRAME_HDR = 24
 def _apply_wal(wal_path, out_path, enc_key, decrypt_page, page_sz):
     """Overlay committed frames of an encrypted WAL onto a decrypted DB.
 
+    Self-contained on purpose: when decrypt_db.py gains WAL support, replace
+    the call in refresh_message_dbs() with it and delete this function.
+
     Only frames whose salts match the WAL header, up to the last commit frame,
     are applied (SQLite's own validity rule, minus checksum verification).
     """
@@ -416,17 +428,62 @@ def verify_sent(chat, text, since_ts, cfg, contacts, timeout=VERIFY_TIMEOUT_S,
 # UI driver interface
 # ---------------------------------------------------------------------------
 
+def choose_result(results, expected_names):
+    """Pick the search result to click: the top-most row whose text is exactly
+    one of the expected names. None if there is no exact match."""
+    names = {n.strip() for n in expected_names}
+    best = None
+    for r in results or []:
+        t = (r.get("text") or "").strip()
+        if t in names and (best is None or (r.get("y", 0), r.get("x", 0))
+                           < (best.get("y", 0), best.get("x", 0))):
+            best = r
+    return best
+
+
 class UIDriver:
-    """What send_text needs from the GUI. See AXDriver for the real one."""
+    """What send_text needs from the GUI.
+
+    Implementations: HelperDriver (default; talks to WeChatSendHelper.app over
+    a Unix socket) and AXDriver (direct pyobjc, needs Accessibility for python).
+    Drivers only perform UI primitives; all decisions live in Sender.
+    """
 
     def prepare(self):
         """Check permission / WeChat / lock state, bring WeChat to front.
         Returns an opaque token for restore()."""
         raise NotImplementedError
 
-    def open_chat(self, query, expected_names):
-        """Search for `query` and open the matching chat."""
+    # Search primitives used by the default open_chat().
+    def open_search(self, query):
+        """Focus WeChat's search box and put `query` in it."""
         raise NotImplementedError
+
+    def search_results(self):
+        """Visible result texts: [{"text", "y", "x", ...}], top to bottom."""
+        raise NotImplementedError
+
+    def click_result(self, text):
+        """Click the top-most visible result whose text is exactly `text`."""
+        raise NotImplementedError
+
+    def search_enter(self):
+        """Press Enter in the search box (opens WeChat's top hit)."""
+        raise NotImplementedError
+
+    def open_chat(self, query, expected_names, settle=1.2, sleep=time.sleep):
+        """Search for `query` and open the matching chat.
+
+        Clicks an exact-text result if one is visible; otherwise opens
+        WeChat's top hit. The caller must verify the chat title afterwards.
+        """
+        self.open_search(query)
+        sleep(settle)  # results load asynchronously
+        hit = choose_result(self.search_results(), expected_names)
+        if hit is not None:
+            self.click_result(hit["text"].strip())
+        else:
+            self.search_enter()
 
     def chat_title(self):
         """Title of the currently open chat, or None if it can't be read."""
@@ -442,7 +499,11 @@ class UIDriver:
     def clear_input(self):
         raise NotImplementedError
 
-    def press_send(self, send_key):
+    def press_send(self, send_key, expected_title, expected_input):
+        """Press the send key, but only if the chat title is still exactly
+        `expected_title` and the input box still holds exactly
+        `expected_input` (the values the caller just read and approved).
+        Returns the input box contents afterwards (None if unreadable)."""
         raise NotImplementedError
 
     def restore(self, token):
@@ -481,7 +542,7 @@ class Sender:
     @property
     def driver(self):
         if self._driver is None:
-            self._driver = AXDriver()
+            self._driver = make_driver(self.cfg)
         return self._driver
 
     def resolve(self, chat):
@@ -543,8 +604,13 @@ class Sender:
         pasted = False
         try:
             d.open_chat(names[0], names)
-            title = d.chat_title()
-            if not title_matches(title, names, target["is_group"]):
+            title = None
+            for _ in range(8):  # the chat pane may take a moment to switch
+                title = d.chat_title()
+                if title_matches(title, names, target["is_group"]):
+                    break
+                self.sleep(0.25)
+            else:
                 raise UIError("opened chat title does not match the expected chat; "
                               "nothing was typed", title_found=title is not None)
             existing = d.input_text()
@@ -568,10 +634,8 @@ class Sender:
                 pasted = False
                 return self.clock()
             sent_at = self.clock()
-            d.press_send(send_key)
+            leftover = d.press_send(send_key, title, current)
             pasted = False
-            self.sleep(0.5)
-            leftover = d.input_text()
             if leftover and leftover.strip():
                 # Enter inserted a newline instead of sending (Cmd+Enter mode?)
                 d.clear_input()
@@ -620,6 +684,227 @@ def send_message_tool(chat, text, dry_run=False, cfg=None, driver=None):
     except Exception as e:
         return {"status": "failed", "error": "internal_error",
                 "message": f"{type(e).__name__}: {e}"}
+
+
+# ---------------------------------------------------------------------------
+# Default driver: WeChatSendHelper.app over a Unix socket
+# ---------------------------------------------------------------------------
+
+HELPER_LABEL = "local.wechat-decrypt-export.sendhelper"
+HELPER_APP = os.path.expanduser("~/Applications/WeChatSendHelper.app")
+HELPER_PLIST = os.path.expanduser(f"~/Library/LaunchAgents/{HELPER_LABEL}.plist")
+HELPER_SOCKET = os.path.expanduser(
+    "~/Library/Application Support/wechat-decrypt-export/sendhelper.sock")
+
+HELPER_INSTALL_HINT = (
+    "WeChatSendHelper is not installed or not running. Install it with "
+    "helper/install.sh, then grant it Accessibility in System Settings -> "
+    "Privacy & Security -> Accessibility (~/Applications/WeChatSendHelper.app).")
+HELPER_TRUST_HINT = (
+    "WeChatSendHelper has no Accessibility permission. Open System Settings -> "
+    "Privacy & Security -> Accessibility and turn on WeChatSendHelper (if it is "
+    "missing, click + and add ~/Applications/WeChatSendHelper.app). After a helper "
+    "rebuild, remove the old entry and add it again.")
+
+# Client-side timeouts: the helper's own per-op timeout plus a margin.
+_HELPER_TIMEOUTS = {
+    "ping": 4, "status": 7, "request_trust": 7, "activate": 10, "restore": 5,
+    "open_search": 8, "search_results": 8, "click_result": 8, "search_enter": 6,
+    "escape": 5, "chat_title": 8, "input_text": 6, "paste_input": 8,
+    "clear_input": 6, "send": 8, "probe": 32,
+}
+
+_HELPER_ERRORS = {
+    "not_trusted": lambda m: AccessibilityDenied(HELPER_TRUST_HINT),
+    "screen_locked": lambda m: ScreenLocked("the screen is locked; unlock the Mac to send"),
+    "wechat_not_running": lambda m: WeChatNotRunning("WeChat is not running; start it and log in"),
+}
+
+
+class HelperClient:
+    """Newline-delimited JSON over the helper's Unix socket.
+
+    One connection is held for a whole send so requests from other clients
+    can't interleave (the helper serves one connection at a time).
+    """
+
+    def __init__(self, path=HELPER_SOCKET):
+        self.path = path
+        self.sock = None
+        self._buf = b""
+        self._id = 0
+
+    def connect(self):
+        import socket
+        if self.sock is not None:
+            return
+        if not os.path.exists(self.path):
+            raise HelperUnavailable(HELPER_INSTALL_HINT, socket=self.path)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(5)
+        try:
+            s.connect(self.path)
+        except OSError as e:
+            s.close()
+            raise HelperUnavailable(f"{HELPER_INSTALL_HINT} ({type(e).__name__})",
+                                    socket=self.path)
+        self.sock = s
+        self._buf = b""
+
+    def close(self):
+        if self.sock is not None:
+            with contextlib.suppress(OSError):
+                self.sock.close()
+            self.sock = None
+
+    def call(self, op, **args):
+        """Return the result dict, or raise a SendError."""
+        import socket
+        self.connect()
+        self._id += 1
+        req = {"id": self._id, "op": op, **args}
+        self.sock.settimeout(_HELPER_TIMEOUTS.get(op, 8))
+        try:
+            self.sock.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+            while b"\n" not in self._buf:
+                chunk = self.sock.recv(65536)
+                if not chunk:
+                    raise ConnectionError("helper closed the connection")
+                self._buf += chunk
+        except socket.timeout:
+            self.close()
+            raise UIError(f"helper op {op!r} timed out", op=op,
+                          maybe_sent=(op == "send"))
+        except OSError as e:
+            self.close()
+            if op == "send":
+                raise UIError(f"lost helper connection during send ({type(e).__name__})",
+                              op=op, maybe_sent=True)
+            raise HelperUnavailable(f"{HELPER_INSTALL_HINT} ({type(e).__name__})")
+        line, self._buf = self._buf.split(b"\n", 1)
+        try:
+            resp = json.loads(line)
+        except ValueError:
+            self.close()
+            raise UIError("helper sent an invalid response", op=op)
+        if resp.get("id") != self._id:
+            self.close()
+            raise UIError("helper response id mismatch", op=op)
+        if resp.get("ok"):
+            return resp.get("result") or {}
+        err = resp.get("error") or {}
+        code, msg = err.get("code", "unknown"), err.get("message", "")
+        if code in _HELPER_ERRORS:
+            raise _HELPER_ERRORS[code](msg)
+        raise UIError(f"helper: {msg or code}", helper_error=code, op=op,
+                      maybe_sent=(op == "send" and code == "timeout"))
+
+
+class HelperDriver(UIDriver):
+    def __init__(self, client=None):
+        self.client = client or HelperClient()
+
+    def status(self):
+        try:
+            return self.client.call("status")
+        finally:
+            self.client.close()
+
+    def prepare(self):
+        self.client.close()
+        st = self.client.call("status")
+        if not st.get("trusted"):
+            raise AccessibilityDenied(HELPER_TRUST_HINT)
+        if st.get("screen_locked"):
+            raise ScreenLocked("the screen is locked; unlock the Mac to send")
+        if not st.get("wechat_running"):
+            raise WeChatNotRunning("WeChat is not running; start it and log in")
+        return self.client.call("activate").get("previous_pid")
+
+    def open_search(self, query):
+        self.client.call("open_search", query=query)
+
+    def search_results(self):
+        return self.client.call("search_results").get("results") or []
+
+    def click_result(self, text):
+        self.client.call("click_result", text=text)
+
+    def search_enter(self):
+        self.client.call("search_enter")
+
+    def chat_title(self):
+        return self.client.call("chat_title").get("title")
+
+    def input_text(self):
+        return self.client.call("input_text").get("text")
+
+    def paste_into_input(self, text):
+        self.client.call("paste_input", text=text)
+
+    def clear_input(self):
+        self.client.call("clear_input")
+
+    def press_send(self, send_key, expected_title, expected_input):
+        return self.client.call("send", key=send_key, expected_title=expected_title,
+                                expected_input=expected_input).get("leftover")
+
+    def restore(self, token):
+        try:
+            if token:
+                self.client.call("restore", pid=token)
+        finally:
+            self.client.close()
+
+    def probe(self, show_text=False):
+        try:
+            return self.client.call("probe", show_text=show_text).get("lines") or []
+        finally:
+            self.client.close()
+
+
+def make_driver(cfg):
+    kind = (cfg or {}).get("send_driver", "helper")
+    if kind == "helper":
+        return HelperDriver(HelperClient((cfg or {}).get("send_helper_socket") or HELPER_SOCKET))
+    if kind == "direct":
+        return AXDriver()
+    raise SendError(f"unknown send_driver {kind!r} (use 'helper' or 'direct')")
+
+
+def helper_check(client=None, launchctl=None):
+    """Installation + runtime status of the helper, for --check."""
+    import subprocess
+    info = {
+        "driver": "helper",
+        "app_installed": os.path.isdir(HELPER_APP),
+        "launch_agent_installed": os.path.isfile(HELPER_PLIST),
+        "socket": HELPER_SOCKET,
+        "socket_exists": os.path.exists(HELPER_SOCKET),
+    }
+    if launchctl is None:
+        def launchctl():
+            r = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{HELPER_LABEL}"],
+                               capture_output=True, text=True)
+            return r.returncode == 0
+    with contextlib.suppress(Exception):
+        info["launch_agent_loaded"] = bool(launchctl())
+    client = client or HelperClient()
+    try:
+        st = client.call("status")
+        info["running"] = True
+        info.update({k: st.get(k) for k in (
+            "version", "trusted", "screen_locked", "wechat_running",
+            "wechat_frontmost", "wechat_window", "wechat_minimized")})
+        if not st.get("trusted"):
+            info["hint"] = HELPER_TRUST_HINT
+    except SendError as e:
+        info["running"] = False
+        info["error"] = e.code
+        info["hint"] = HELPER_INSTALL_HINT
+    finally:
+        client.close()
+    return info
 
 
 # ---------------------------------------------------------------------------
@@ -908,7 +1193,7 @@ class AXDriver(UIDriver):
         return el
 
     # -- actions -----------------------------------------------------------
-    def open_chat(self, query, expected_names):
+    def open_search(self, query):
         self._ensure_front()
         self._key(KC_F, cmd=True)
         self._wait(0.4)
@@ -916,33 +1201,46 @@ class AXDriver(UIDriver):
         if focused is None or self._attr(focused, "AXRole") not in _EDIT_ROLES:
             self._key(KC_ESCAPE)
             raise UIError("WeChat search box did not take focus")
+        self._search = focused
         self._key(KC_A, cmd=True)
         self._paste(query)
-        self._wait(1.2)  # results load asynchronously
-        self._ensure_front()
 
-        # Prefer a result row whose text is exactly the expected name, in the
-        # left column below the search box. Otherwise take WeChat's top hit;
-        # the caller verifies the opened chat's title either way.
-        sf = self._frame(focused)
+    def _results(self):
+        self._ensure_front()
+        sf = self._frame(self._search) if getattr(self, "_search", None) else None
         if sf is None:
-            raise UIError("can't locate the search box")
-        target = None
+            raise UIError("no active search")
+        wf = self._frame(self.window)
+        max_x = max(sf[0] + sf[2] + 60, wf[0] + wf[2] * 0.45)
+        out = []
         for role, f, el in self._elements():
-            if role not in ("AXStaticText", "AXCell", "AXRow"):
+            if role not in ("AXStaticText", "AXCell", "AXRow", "AXButton"):
                 continue
-            if f[1] <= sf[1] + sf[3] or f[0] > sf[0] + sf[2] + 40:
+            if f[1] <= sf[1] + sf[3] or not (wf[0] <= f[0] < max_x) or not (0 < f[3] < 200):
                 continue
             t = self._text(el)
-            if t and t.strip() in expected_names:
-                if target is None or f[1] < target[1]:
-                    target = f
-        if target is not None:
-            self._click(target)
-        else:
-            self._key(KC_RETURN)
-        self._wait(0.8)
+            if t:
+                out.append({"text": t, "x": int(f[0]), "y": int(f[1]), "frame": f})
+        out.sort(key=lambda r: (r["y"], r["x"]))
+        return out
+
+    def search_results(self):
+        return [{k: v for k, v in r.items() if k != "frame"} for r in self._results()]
+
+    def click_result(self, text):
+        for r in self._results():
+            if r["text"].strip() == text:
+                self._click(r["frame"])
+                self._wait(0.4)
+                self._search = None
+                return
+        raise UIError("search result not found")
+
+    def search_enter(self):
         self._ensure_front()
+        self._key(KC_RETURN)
+        self._wait(0.4)
+        self._search = None
 
     def paste_into_input(self, text):
         self._ensure_front()
@@ -955,9 +1253,17 @@ class AXDriver(UIDriver):
         self._key(KC_DELETE)
         self._wait(0.1)
 
-    def press_send(self, send_key):
+    def press_send(self, send_key, expected_title, expected_input):
+        self._ensure_front()
+        if self.chat_title() != expected_title:
+            raise UIError("chat title changed before sending")
+        if self.input_text() != expected_input:
+            raise UIError("input box changed before sending")
+        self._focus_input()
         self._ensure_front()
         self._key(KC_RETURN, cmd=(send_key == "cmd_enter"))
+        self._wait(0.5)
+        return self.input_text()
 
     # -- diagnostics -------------------------------------------------------
     def dump_tree(self, show_text=False, out=sys.stdout):
@@ -1001,11 +1307,23 @@ def main(argv=None):
     ap.add_argument("--show-text", action="store_true", help="with --probe: show texts")
     args = ap.parse_args(argv)
 
-    if args.check:
-        print(json.dumps(AXDriver().check(), indent=2))
-        return 0
-    if args.probe:
-        AXDriver().dump_tree(show_text=args.show_text)
+    if args.check or args.probe:
+        with contextlib.redirect_stdout(sys.stderr):
+            from config import load_config
+            kind = load_config().get("send_driver", "helper")
+        if args.check:
+            info = helper_check() if kind == "helper" else {"driver": "direct",
+                                                            **AXDriver().check()}
+            print(json.dumps(info, indent=2, ensure_ascii=False))
+            return 0
+        try:
+            if kind == "helper":
+                print("\n".join(HelperDriver().probe(show_text=args.show_text)))
+            else:
+                AXDriver().dump_tree(show_text=args.show_text)
+        except SendError as e:
+            print(json.dumps(e.to_dict(), ensure_ascii=False, indent=2))
+            return 2
         return 0
     if not args.to or args.text is None:
         ap.error("--to and --text are required")

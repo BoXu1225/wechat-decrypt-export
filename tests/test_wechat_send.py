@@ -60,9 +60,13 @@ class FakeDriver(W.UIDriver):
         self.calls.append("clear")
         self.box = ""
 
-    def press_send(self, send_key):
+    def press_send(self, send_key, expected_title, expected_input):
+        # Like the helper: refuse unless state is exactly what was approved.
+        if expected_title != self.current_title or expected_input != self.box:
+            raise W.UIError("precondition_failed")
         self.calls.append(("enter", send_key))
         self.box = self.leftover
+        return self.box
 
     def restore(self, token):
         self.calls.append(("restore", token))
@@ -279,7 +283,7 @@ class SendFlowTests(Base):
     def test_driver_exception_clears_and_restores(self):
         d = FakeDriver()
 
-        def boom(send_key):
+        def boom(send_key, expected_title, expected_input):
             raise RuntimeError("x")
         d.press_send = boom
         with self.assertRaises(RuntimeError):
@@ -444,6 +448,234 @@ class WalTests(unittest.TestCase):
             self.assertEqual([p[0] for p in pages], [0x01, 0x22, 0x01, 0x44])
         finally:
             shutil.rmtree(tmp)
+
+
+class FakeHelperServer:
+    """Unix-socket server speaking the helper protocol from a handler table."""
+
+    def __init__(self, handlers):
+        import socket
+        import threading
+        self.dir = tempfile.mkdtemp(prefix="wsh")
+        self.path = os.path.join(self.dir, "s.sock")
+        self.handlers = handlers
+        self.requests = []
+        self.connections = 0
+        self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.srv.bind(self.path)
+        self.srv.listen(4)
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def _serve(self):
+        while True:
+            try:
+                c, _ = self.srv.accept()
+            except OSError:
+                return
+            self.connections += 1
+            f = c.makefile("rwb")
+            for line in f:
+                req = json.loads(line)
+                self.requests.append(req)
+                h = self.handlers.get(req["op"])
+                if h is None:
+                    resp = {"ok": False, "error": {"code": "unknown_op", "message": "x"}}
+                elif h == "hang":
+                    continue
+                elif h == "close":
+                    break
+                else:
+                    resp = h(req)
+                    wrong_id = resp.pop("wrong_id", False)
+                    if resp.get("ok") is None:
+                        resp = {"ok": True, "result": resp}
+                    if wrong_id:
+                        resp["id"] = -1
+                resp.setdefault("id", req.get("id"))
+                f.write((json.dumps(resp) + "\n").encode())
+                f.flush()
+            f.close()
+            c.close()
+
+    def ops(self):
+        return [r["op"] for r in self.requests]
+
+    def close(self):
+        self.srv.close()
+        shutil.rmtree(self.dir)
+
+
+def _err(code):
+    return lambda req: {"ok": False, "error": {"code": code, "message": code}}
+
+
+STATUS_OK = {"trusted": True, "screen_locked": False, "wechat_running": True}
+
+
+class HelperDriverTests(unittest.TestCase):
+    def make(self, **handlers):
+        base = {"status": lambda r: dict(STATUS_OK),
+                "activate": lambda r: {"previous_pid": 42},
+                "restore": lambda r: {"restored": True}}
+        base.update(handlers)
+        self.server = FakeHelperServer(base)
+        self.addCleanup(self.server.close)
+        return W.HelperDriver(W.HelperClient(self.server.path))
+
+    def test_missing_socket(self):
+        d = W.HelperDriver(W.HelperClient("/nonexistent/dir/s.sock"))
+        with self.assertRaises(W.HelperUnavailable) as cm:
+            d.prepare()
+        self.assertEqual(cm.exception.code, "helper_unavailable")
+        self.assertIn("install.sh", str(cm.exception))
+
+    def test_stale_socket_file(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        path = os.path.join(tmp, "s.sock")
+        import socket
+        s = socket.socket(socket.AF_UNIX)
+        s.bind(path)
+        s.close()   # file exists, nobody listening
+        with self.assertRaises(W.HelperUnavailable):
+            W.HelperDriver(W.HelperClient(path)).prepare()
+
+    def test_prepare_checks_status(self):
+        for status, exc in ((dict(STATUS_OK, trusted=False), W.AccessibilityDenied),
+                            (dict(STATUS_OK, screen_locked=True), W.ScreenLocked),
+                            (dict(STATUS_OK, wechat_running=False), W.WeChatNotRunning)):
+            d = self.make(status=lambda r, st=status: st)
+            with self.assertRaises(exc):
+                d.prepare()
+            self.assertNotIn("activate", self.server.ops())
+
+    def test_error_code_mapping(self):
+        d = self.make(chat_title=_err("not_trusted"), input_text=_err("screen_locked"),
+                      clear_input=_err("wechat_not_running"), paste_input=_err("no_input"))
+        with self.assertRaises(W.AccessibilityDenied) as cm:
+            d.chat_title()
+        self.assertIn("Accessibility", str(cm.exception))
+        with self.assertRaises(W.ScreenLocked):
+            d.input_text()
+        with self.assertRaises(W.WeChatNotRunning):
+            d.clear_input()
+        with self.assertRaises(W.UIError) as cm:
+            d.paste_into_input("x")
+        self.assertEqual(cm.exception.extra["helper_error"], "no_input")
+
+    def test_full_send_over_socket(self):
+        state = {"title": None, "box": ""}
+
+        def click(req):
+            state["title"] = "Alice"
+            return {"clicked": True}
+
+        def paste(req):
+            state["box"] = req["text"]
+            return {"text": state["box"]}
+
+        def send(req):
+            if req["expected_title"] != state["title"] or req["expected_input"] != state["box"]:
+                return {"ok": False, "error": {"code": "precondition_failed", "message": ""}}
+            state["box"] = ""
+            return {"pressed": True, "leftover": ""}
+
+        d = self.make(
+            open_search=lambda r: {"value_matches": True},
+            search_results=lambda r: {"results": [
+                {"text": "Chat History", "y": 90, "x": 0},
+                {"text": "Alice", "y": 200, "x": 10},
+                {"text": "Alice", "y": 120, "x": 10}]},
+            click_result=click,
+            chat_title=lambda r: {"title": state["title"]},
+            input_text=lambda r: {"text": state["box"]},
+            paste_input=paste, send=send)
+        cfg = {"decrypted_dir": self.server.dir,
+               "send_log": os.path.join(self.server.dir, "log.jsonl")}
+        clock = Clock()
+        sender = _RealSender(cfg, driver=d,
+                             data_loader=lambda c: (dict(CONTACTS), list(CHAT_LIST)),
+                             verifier=lambda *a: ("sent", None), clock=clock,
+                             sleep=clock.sleep)
+        res = sender.send_text("Alice", "hello")
+        self.assertEqual(res["status"], "sent")
+        self.assertEqual(self.server.ops(), [
+            "status", "activate", "open_search", "search_results", "click_result",
+            "chat_title", "input_text", "paste_input", "chat_title", "input_text",
+            "send", "restore"])
+        reqs = {r["op"]: r for r in self.server.requests}
+        self.assertEqual(reqs["click_result"]["text"], "Alice")
+        self.assertEqual(reqs["open_search"]["query"], "Alice")
+        self.assertEqual(reqs["send"]["expected_title"], "Alice")
+        self.assertEqual(reqs["send"]["expected_input"], "hello")
+        self.assertEqual(reqs["send"]["key"], "enter")
+        self.assertEqual(reqs["restore"]["pid"], 42)
+        self.assertEqual(self.server.connections, 1)   # one connection per send
+
+    def test_no_exact_result_uses_search_enter(self):
+        d = self.make(open_search=lambda r: {}, search_enter=lambda r: {},
+                      search_results=lambda r: {"results": [{"text": "Alicia", "y": 1}]})
+        d.open_chat("Alice", ["Alice"], sleep=lambda s: None)
+        self.assertEqual(self.server.ops()[-1], "search_enter")
+
+    def test_send_precondition_failure_is_ui_error(self):
+        d = self.make(send=_err("precondition_failed"))
+        with self.assertRaises(W.UIError) as cm:
+            d.press_send("enter", "t", "x")
+        self.assertFalse(cm.exception.extra["maybe_sent"])
+
+    def test_timeout_marks_maybe_sent(self):
+        d = self.make(send="hang")
+        orig = W._HELPER_TIMEOUTS["send"]
+        W._HELPER_TIMEOUTS["send"] = 0.3
+        try:
+            with self.assertRaises(W.UIError) as cm:
+                d.press_send("enter", "t", "x")
+        finally:
+            W._HELPER_TIMEOUTS["send"] = orig
+        self.assertTrue(cm.exception.extra["maybe_sent"])
+
+    def test_connection_closed(self):
+        d = self.make(chat_title="close")
+        with self.assertRaises(W.HelperUnavailable):
+            d.chat_title()
+
+    def test_response_id_mismatch(self):
+        d = self.make(chat_title=lambda r: {"title": "x", "wrong_id": True})
+        with self.assertRaises(W.UIError):
+            d.chat_title()
+
+    def test_helper_check(self):
+        self.make(status=lambda r: dict(STATUS_OK, trusted=False, version="1"))
+        info = W.helper_check(W.HelperClient(self.server.path), launchctl=lambda: True)
+        self.assertTrue(info["running"])
+        self.assertFalse(info["trusted"])
+        self.assertTrue(info["launch_agent_loaded"])
+        self.assertIn("Accessibility", info["hint"])
+        info = W.helper_check(W.HelperClient("/nonexistent/s.sock"), launchctl=lambda: False)
+        self.assertFalse(info["running"])
+        self.assertEqual(info["error"], "helper_unavailable")
+
+    def test_make_driver(self):
+        self.assertIsInstance(W.make_driver({}), W.HelperDriver)
+        with self.assertRaises(W.SendError):
+            W.make_driver({"send_driver": "bogus"})
+
+
+class ChooseResultTests(unittest.TestCase):
+    def test_topmost_exact(self):
+        rows = [{"text": "Alice ", "y": 300}, {"text": "Alice", "y": 100, "x": 5},
+                {"text": "Alice2", "y": 50}]
+        self.assertEqual(W.choose_result(rows, ["Alice"])["y"], 100)
+
+    def test_none(self):
+        self.assertIsNone(W.choose_result([{"text": "alice", "y": 1}], ["Alice"]))
+        self.assertIsNone(W.choose_result([], ["Alice"]))
+
+    def test_aliases(self):
+        r = W.choose_result([{"text": "File Transfer", "y": 1}], ["文件传输助手", "File Transfer"])
+        self.assertEqual(r["text"], "File Transfer")
 
 
 if __name__ == "__main__":
