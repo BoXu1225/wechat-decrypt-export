@@ -42,8 +42,9 @@ def quiet():
 class FakeRunner:
     """Stands in for subprocess.run: answers --help, fakes export runs, records everything."""
 
-    def __init__(self, help_text=HELP_BASE, export_rc=0, export_out=None):
+    def __init__(self, help_text=HELP_BASE, export_rc=0, export_out=None, access="ok"):
         self.help_text = help_text
+        self.access = access
         self.export_rc = export_rc
         self.export_out = export_out if export_out is not None else (
             f"[+] 共 3 个聊天\n  [1/3] {SECRET_NAME} [群]: +5\n  [2/3] 李四: +2\n"
@@ -56,6 +57,10 @@ class FakeRunner:
             return SimpleNamespace(returncode=0, stdout=self.help_text, stderr="")
         if cmd[0].endswith("osascript"):
             return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[1] == "-c":   # data-access probe
+            if self.access == "timeout":
+                raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+            return SimpleNamespace(returncode=0 if self.access == "ok" else 1, stdout="", stderr="")
         return SimpleNamespace(returncode=self.export_rc, stdout=self.export_out,
                                stderr="Traceback: boom" if self.export_rc else "")
 
@@ -342,6 +347,26 @@ class RunBackupTest(DecryptTestBase):
             B.run_backup(self.cfg(), runner=runner, decrypt_module=D, notify_enabled=False)
         self.assertEqual(runner.notifications(), [])
 
+    def test_no_data_access(self):
+        # launchd without Full Disk Access: probe blocks on the TCC prompt (timeout) or is denied.
+        self.write_keys(KEY.hex(), time.time() + 100)
+        for access in ("timeout", "denied"):
+            with self.subTest(access=access):
+                runner = FakeRunner(access=access)
+                with mock.patch.object(B, "decrypt_changed") as dec:
+                    code, entry = self.run_backup(runner)
+                dec.assert_not_called()                      # never touches the WeChat dir
+                self.assertEqual(code, B.EXIT_FAIL)
+                self.assertEqual(entry["access"], access)
+                self.assertTrue(any("完全磁盘访问权限" in e for e in entry["errors"]))
+                exports = runner.exports()
+                self.assertEqual(len(exports), 2)            # text export of existing data still runs
+                for c in exports:
+                    self.assertFalse({"--images", "--media"} & set(c))
+                notes = runner.notifications()
+                self.assertEqual(len(notes), 1)
+                self.assertIn("完全磁盘访问权限", notes[0][-1])
+
     def test_decrypt_crash_is_recorded(self):
         self.write_keys(KEY.hex(), time.time() + 100)
         with mock.patch.object(B, "decrypt_changed", side_effect=OSError("disk gone")):
@@ -368,6 +393,14 @@ class ParseOutputTest(unittest.TestCase):
         B.notify('a "b" \\ c', runner=runner)
         self.assertEqual(runner.calls[0][-1],
                          'display notification "a \\"b\\" \\\\ c" with title "微信聊天备份"')
+
+    def test_access_probe_real(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        os.makedirs(os.path.join(tmp, "message"))
+        open(os.path.join(tmp, "message", "m.db"), "wb").close()
+        self.assertIsNone(B.check_data_access(tmp))
+        self.assertEqual(B.check_data_access(os.path.join(tmp, "missing")), "denied")
 
     def test_real_export_cli_capabilities(self):
         caps = B.export_capabilities()

@@ -27,7 +27,8 @@ config.json 中的可选配置（以下为默认值）:
 跳过的数据库、错误），不含任何消息内容或聊天名称。
 
 密钥缺失或过期时绝不提权：对应数据库跳过（导出使用上次解密的数据），并发送一条通知。
-只读文件，不需要图形界面，屏幕锁定时也能运行。
+只读写文件，不需要图形界面，屏幕锁定时也能运行。由 launchd 启动时需要为 Python 授予
+「完全磁盘访问权限」才能读取微信数据目录；没有权限时不会卡在授权弹窗上（预检超时即放弃并通知）。
 """
 import argparse
 import contextlib
@@ -61,6 +62,9 @@ LAUNCHD_LOG = os.path.join(LAUNCHD_LOG_DIR, "backup.log")
 ALL_FORMATS = ("txt", "md", "html", "json", "csv")
 DEFAULTS = {"formats": ["html", "txt"], "media": True, "dir": "export", "time": "03:30"}
 EXPORT_TIMEOUT = 4 * 3600  # 单个格式导出的上限（秒）
+# 读取微信数据目录的预检上限（秒）。由 launchd 启动时，macOS 会就「访问其他 App 的数据」
+# 弹出授权对话框，并让读取一直阻塞到有人点击；无人值守时不能卡住，超时即放弃
+ACCESS_TIMEOUT = 45
 
 EXIT_OK, EXIT_FAIL, EXIT_CONFIG, EXIT_LOCKED, EXIT_NEEDS_KEYS = 0, 1, 2, 3, 4
 
@@ -262,6 +266,39 @@ def decrypt_changed(D, verbose=False):
 
 
 # ---------------------------------------------------------------------------
+# macOS 隐私权限预检
+# ---------------------------------------------------------------------------
+
+_ACCESS_PROBE = """
+import os, sys
+d = sys.argv[1]
+os.listdir(d)
+for root, dirs, files in os.walk(d):
+    for f in files:
+        if f.endswith(".db"):
+            open(os.path.join(root, f), "rb").close()
+            sys.exit(0)
+"""
+
+
+def python_real_path():
+    """实际运行的 Python 可执行文件（macOS 隐私权限按它授予，而不是 venv 里的软链接）。"""
+    return os.path.realpath(python_bin())
+
+
+def check_data_access(db_dir, runner=subprocess.run, timeout=None):
+    """在子进程中试读微信数据目录。可读返回 None，否则返回 "denied" / "timeout"。
+
+    子进程被授权弹窗阻塞时会在超时后被杀掉，备份本身不会卡住。"""
+    try:
+        p = runner([python_bin(), "-c", _ACCESS_PROBE, db_dir], stdin=subprocess.DEVNULL,
+                   capture_output=True, text=True, timeout=timeout or ACCESS_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return "timeout"
+    return None if p.returncode == 0 else "denied"
+
+
+# ---------------------------------------------------------------------------
 # 导出（子进程调用 export_chat.py --all -i）
 # ---------------------------------------------------------------------------
 
@@ -384,7 +421,10 @@ def notify(message, title=NOTIFY_TITLE, runner=subprocess.run):
 def notification_text(entry):
     """需要通知时返回文本，否则返回 None（成功时不打扰）。"""
     parts = []
-    if entry["status"] == "error":
+    if entry.get("access"):
+        parts.append("无法读取微信数据（macOS 隐私权限），请在「完全磁盘访问权限」中添加 Python，"
+                     "详见 ./wechat backup --status")
+    elif entry["status"] == "error":
         parts.append(f"备份失败（{len(entry['errors'])} 个错误），详见 logs/backup.jsonl")
     n = len(entry.get("needs_key") or [])
     if n:
@@ -406,7 +446,7 @@ def run_backup(cfg, *, notify_enabled=True, verbose=False, trigger="manual",
         "trigger": trigger, "status": "ok", "exit_code": EXIT_OK,
         "formats": cfg["formats"], "media": None, "dir": cfg["dir"],
         "chats_updated": 0, "messages_added": 0,
-        "decrypt": None, "needs_key": [], "skipped_dbs": [], "exports": [], "errors": [],
+        "access": None, "decrypt": None, "needs_key": [], "skipped_dbs": [], "exports": [], "errors": [],
     }
     print(f"[+] {entry['time']} 开始备份 -> {cfg['dir']}（格式: {', '.join(cfg['formats'])}）")
 
@@ -414,6 +454,10 @@ def run_backup(cfg, *, notify_enabled=True, verbose=False, trigger="manual",
     td = time.monotonic()
     try:
         D = decrypt_module or import_decrypt_db()
+        access = check_data_access(D.DB_DIR, runner)
+        if access:
+            entry["access"] = access
+            raise PermissionError(access)
         with no_key_scanner(D):
             dres = decrypt_changed(D, verbose=verbose)
         entry["decrypt"] = {"decrypted": dres["decrypted"], "unchanged": dres["unchanged"],
@@ -431,6 +475,14 @@ def run_backup(cfg, *, notify_enabled=True, verbose=False, trigger="manual",
             print(f"[!] 以下数据库需要新密钥（请手动运行 ./wechat decrypt）: {', '.join(dres['needs_key'])}")
     except ConfigError as e:
         entry["errors"].append(str(e))
+    except PermissionError:
+        entry["access"] = entry.get("access") or "denied"
+        entry["errors"].append(
+            "无法读取微信数据目录（macOS 隐私权限"
+            + ("，读取被授权对话框阻塞" if entry.get("access") == "timeout" else "")
+            + f"）: 请在 系统设置 > 隐私与安全性 > 完全磁盘访问权限 中添加 {python_real_path()}")
+        print("[!] " + entry["errors"][-1])
+        print("[!] 跳过解密和媒体导出，只用上次解密的数据导出文字记录")
     except Exception as e:
         entry["errors"].append(f"解密出错: {type(e).__name__}: {e}")
 
@@ -443,7 +495,8 @@ def run_backup(cfg, *, notify_enabled=True, verbose=False, trigger="manual",
         caps = None
         entry["errors"].append(f"无法调用导出命令: {e}")
     if caps is not None:
-        mflag = media_flag(caps, cfg["media"])
+        # 没有读取权限时不导出媒体（图片在微信数据目录中，读取同样会被阻塞）
+        mflag = None if entry.get("access") else media_flag(caps, cfg["media"])
         entry["media"] = mflag
         os.makedirs(cfg["dir"], exist_ok=True)
         for fmt in cfg["formats"]:
@@ -544,6 +597,11 @@ def install(cfg, export_dir=None):
     print(f"    日志: {LAUNCHD_LOG}，摘要: {SUMMARY_FILE}")
     print("    电脑在该时间处于睡眠时，会在唤醒后补跑一次；关机或未登录时不会运行。")
     print("    立即试运行: launchctl kickstart " + f"{_domain()}/{LABEL}")
+    print("[!] 由 launchd 启动时，macOS 要求单独授权读取微信的数据（终端里的授权不适用）。")
+    print("    请在 系统设置 > 隐私与安全性 > 完全磁盘访问权限 中点 +，按 ⌘⇧G 输入下面的路径并添加:")
+    print(f"      {python_real_path()}")
+    print("    （或在试运行时弹出的「想访问其他 App 的数据」对话框中点「允许」。"
+          "Homebrew 升级 Python 后路径会变化，需要重新添加）")
     return EXIT_OK
 
 
@@ -607,6 +665,10 @@ def status(cfg):
             print(f"  [!] {len(last['needs_key'])} 个数据库需要新密钥: 请手动运行 ./wechat decrypt")
         for e in last.get("errors") or []:
             print(f"  [!] {e}")
+        if last.get("access"):
+            print(f"  [!] 定时任务没有读取微信数据的权限: 请把 {python_real_path()} 加入"
+                  "「完全磁盘访问权限」，然后运行 launchctl kickstart "
+                  f"{_domain()}/{LABEL} 验证")
     else:
         print("上次运行: 无记录")
     return EXIT_OK
