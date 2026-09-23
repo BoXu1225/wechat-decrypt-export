@@ -93,6 +93,17 @@ class ExportCliTest(unittest.TestCase):
         _, out = self.run_cli("--list", "alice")
         self.assertNotIn("Test Group", out)
 
+    def test_list_names_unnamed_group_like_mcp(self):
+        conn = sqlite3.connect(os.path.join(self.dec, "contact", "contact.db"))
+        conn.execute("UPDATE contact SET nick_name='' WHERE username=?", (ROOM,))
+        conn.commit()
+        conn.close()
+        rc, out = self.run_cli("--list")
+        self.assertEqual(rc, 0)
+        self.assertRegex(out.splitlines()[1], r"^Bobby、Dave Stranger、carol_custom\s+\[群\]\s+8")
+        rc, out = self.run_cli("--list", "dave stranger")
+        self.assertIn("共 1 个聊天（单聊 0，群聊 1）", out)
+
     def test_pick_shows_group_marker(self):
         # "e" matches both "Alice R" and "Test Group"
         rc, out = self.run_cli("e", stdin=["x", "1"])

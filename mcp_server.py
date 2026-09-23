@@ -93,7 +93,6 @@ INDEX_VERSION = "1"
 PLACEHOLDER_KINDS = ("image", "voice", "video", "emoji")
 # Databases the server reads; auto-refresh only re-decrypts these.
 _WANTED_DB_RE = re.compile(r"^(message/message_\d+\.db|message/message_resource\.db|contact/contact\.db)$")
-_MSG_DB_RE = re.compile(r"message_(\d+)\.db$")
 
 
 class ToolError(Exception):
@@ -105,44 +104,19 @@ class ToolError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Small helpers (candidates for chats.py)
+# Small helpers
 # ---------------------------------------------------------------------------
 
-def iso(ts):
-    if not ts:
-        return None
-    return _dt.datetime.fromtimestamp(ts).isoformat(timespec="seconds")
-
-
-_REL_RE = re.compile(r"^\s*(\d+)\s*([mhdw])\s*$")
+iso = C.iso
+db_number = C.db_number
 
 
 def parse_time(value, end=False, now=None):
-    """Parse since/until into unix seconds. None/'' -> None.
-
-    end=True makes a date-only value inclusive (end of that day)."""
-    if value is None or value == "":
-        return None
-    if isinstance(value, (int, float)):
-        return int(value)
-    s = str(value).strip()
-    if re.fullmatch(r"\d{9,11}", s):
-        return int(s)
-    m = _REL_RE.match(s)
-    if m:
-        mult = {"m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}[m.group(2)]
-        return int((now or time.time()) - int(m.group(1)) * mult)
+    """chats.parse_time, reporting unparseable input as a ToolError."""
     try:
-        d = _dt.datetime.fromisoformat(s.replace("/", "-"))
-    except ValueError:
-        raise ToolError(f"cannot parse time {value!r}; use YYYY-MM-DD, "
-                        "YYYY-MM-DD HH:MM, unix seconds, or 7d/12h/30m")
-    date_only = re.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}", s.replace("/", "-")) is not None
-    if d.tzinfo is not None:
-        d = d.astimezone().replace(tzinfo=None)
-    if end and date_only:
-        d = d + _dt.timedelta(days=1) - _dt.timedelta(seconds=1)
-    return int(d.timestamp())
+        return C.parse_time(value, end=end, now=now)
+    except ValueError as e:
+        raise ToolError(str(e)) from None
 
 
 def clamp(n, lo, hi):
@@ -151,63 +125,6 @@ def clamp(n, lo, hi):
     except (TypeError, ValueError):
         n = hi
     return max(lo, min(hi, n))
-
-
-def load_contact_rows(decrypted_dir):
-    """{username: {username, remark, nick_name, alias, local_type, display, source}}.
-
-    contact rows override stranger rows. (chats.load_contacts only returns the
-    display name; we need the individual fields for matching and get_contact.)"""
-    path = os.path.join(decrypted_dir, "contact", "contact.db")
-    if not os.path.exists(path):
-        return {}
-    out = {}
-    conn = sqlite3.connect(path)
-    try:
-        for table in ("stranger", "contact"):
-            if not C._table_exists(conn, table):
-                continue
-            cols = {r[1] for r in conn.execute(f"PRAGMA table_info([{table}])")}
-            alias = "alias" if "alias" in cols else "''"
-            ltype = "local_type" if "local_type" in cols else "0"
-            for u, remark, nick, al, lt in conn.execute(
-                    f"SELECT username, remark, nick_name, {alias}, {ltype} FROM [{table}]"):
-                if not u:
-                    continue
-                out[u] = {
-                    "username": u,
-                    "remark": (remark or "").strip(),
-                    "nick_name": (nick or "").strip(),
-                    "alias": (al or "").strip(),
-                    "local_type": lt or 0,
-                    "display": C._pick_name(u, remark, nick),
-                    "source": table,
-                }
-    finally:
-        conn.close()
-    return out
-
-
-def load_room_members(decrypted_dir):
-    """{room_username: {member_username: group_nickname or ''}} for all rooms
-    (chats.load_group_nicknames drops members without a group nickname)."""
-    path = os.path.join(decrypted_dir, "contact", "contact.db")
-    if not os.path.exists(path):
-        return {}
-    conn = sqlite3.connect(path)
-    try:
-        if not C._table_exists(conn, "chat_room"):
-            return {}
-        return {room: C.parse_chat_room_members(buf)
-                for room, buf in conn.execute("SELECT username, ext_buffer FROM chat_room")
-                if room}
-    finally:
-        conn.close()
-
-
-def db_number(db_path):
-    m = _MSG_DB_RE.search(db_path)
-    return int(m.group(1)) if m else None
 
 
 def _snippet(text, terms, width=60):
@@ -458,27 +375,22 @@ class WeChatData:
         return self._cached("contacts", lambda: C.load_contacts(self.decrypted_dir))
 
     def contact_rows(self):
-        return self._cached("contact_rows", lambda: load_contact_rows(self.decrypted_dir))
+        return self._cached("contact_rows", lambda: C.load_contact_rows(self.decrypted_dir))
 
     def room_members(self):
-        return self._cached("rooms", lambda: load_room_members(self.decrypted_dir))
+        return self._cached("rooms", lambda: C.load_room_members(self.decrypted_dir))
 
     def group_nicknames(self):
-        return self._cached("group_nicks", lambda: {
-            r: {u: n for u, n in m.items() if n} for r, m in self.room_members().items()
-            if any(m.values())})
+        return self._cached("group_nicks",
+                            lambda: C.group_nicknames_from_members(self.room_members()))
 
     def all_chats(self):
         """chats.list_chats output with synthesized names for unnamed groups."""
         def build():
             out = C.list_chats(self.decrypted_dir, contacts=self.contacts())
-            rows, rooms, contacts = self.contact_rows(), self.room_members(), self.contacts()
+            C.name_unnamed_groups(out, self.room_members(), self.contacts(), self.self_wxid)
+            rows = self.contact_rows()
             for c in out:
-                if c["is_group"] and c["name"] == c["username"]:
-                    members = [u for u in rooms.get(c["username"], {}) if u != self.self_wxid]
-                    if members:
-                        names = [contacts.get(u, u) for u in members[:3]]
-                        c["name"] = "、".join(names) + (f"等{len(members) + 1}人" if len(members) > 3 else "")
                 r = rows.get(c["username"], {})
                 c["_names"] = {c["name"], c["username"], r.get("remark"), r.get("nick_name"),
                                r.get("alias")} - {"", None}

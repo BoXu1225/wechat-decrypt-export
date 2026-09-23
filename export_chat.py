@@ -67,18 +67,28 @@ class ChatSource:
         self.self_wxid = self_wxid
         self.contacts = chatlib.load_contacts(decrypted_dir)
         self._chats = {}
+        self._room_members = None
         self._group_nicknames = None
 
     def chats(self, include_system=False):
+        """list_chats 结果；没有群名的群按成员命名（与 MCP 服务一致）。"""
         if include_system not in self._chats:
-            self._chats[include_system] = chatlib.list_chats(
-                self.decrypted_dir, include_system=include_system, contacts=self.contacts)
+            self._chats[include_system] = chatlib.name_unnamed_groups(
+                chatlib.list_chats(self.decrypted_dir, include_system=include_system,
+                                   contacts=self.contacts),
+                self.room_members, self.contacts, self.self_wxid)
         return self._chats[include_system]
+
+    @property
+    def room_members(self):
+        if self._room_members is None:
+            self._room_members = chatlib.load_room_members(self.decrypted_dir)
+        return self._room_members
 
     @property
     def group_nicknames(self):
         if self._group_nicknames is None:
-            self._group_nicknames = chatlib.load_group_nicknames(self.decrypted_dir)
+            self._group_nicknames = chatlib.group_nicknames_from_members(self.room_members)
         return self._group_nicknames
 
     def messages(self, chat, since=None, until=None, with_packed_info=False):
