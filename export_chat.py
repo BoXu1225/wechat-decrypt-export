@@ -6,6 +6,9 @@
     python export_chat.py <联系人>                 # 模糊匹配，多个结果时交互选择
     python export_chat.py <联系人> -o out.txt      # 指定输出文件
     python export_chat.py <联系人> -i              # 增量导出到 export/<联系人>.txt
+    python export_chat.py --list [过滤词]          # 列出有单聊记录的联系人
+    python export_chat.py --all                    # 增量导出全部单聊
+    python export_chat.py <联系人> --since 2024-01-01 --until 2024-12-31
 
 依赖:
     - 已解密的微信数据库 (decrypt_db.py)
@@ -26,7 +29,7 @@ import os
 import re
 import sqlite3
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import zstandard
 
@@ -564,29 +567,99 @@ def resolve_contact(pattern, decrypted_dir=None):
 # CLI
 # ---------------------------------------------------------------------------
 
+def _parse_date(s):
+    try:
+        return datetime.strptime(s, "%Y-%m-%d")
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"日期格式应为 YYYY-MM-DD: {s}")
+
+
+def cmd_list(pattern, decrypted_dir):
+    chats = list_chats(decrypted_dir, pattern)
+    if not chats:
+        print("[!] 没有找到单聊记录" + (f"（过滤: {pattern}）" if pattern else ""))
+        return
+    print(f"{'最后消息':<12}{'消息数':>8}  联系人")
+    for c in chats:
+        day = datetime.fromtimestamp(c["last_ts"]).strftime("%Y-%m-%d") if c["last_ts"] else "-"
+        print(f"{day:<12}{c['count']:>10}  {c['name']}")
+    print(f"[+] 共 {len(chats)} 个单聊")
+
+
+def cmd_all(pattern, decrypted_dir, export_dir, since, until):
+    chats = list_chats(decrypted_dir, pattern)
+    if not chats:
+        print("[!] 没有找到单聊记录")
+        return
+    print(f"[+] 共 {len(chats)} 个单聊，增量导出到 {export_dir}")
+    total_new = changed = 0
+    for i, c in enumerate(chats, 1):
+        n = export_contact(c["username"], c["name"], None, decrypted_dir, incremental=True,
+                           since=since, until=until, export_dir=export_dir,
+                           tables=c["tables"], quiet=True)
+        if n:
+            changed += 1
+            total_new += n
+            print(f"  [{i}/{len(chats)}] {c['name']}: +{n}")
+    print(f"[+] 完成: {changed} 个联系人有新消息，共追加 {total_new} 条")
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="导出微信单聊记录为文本文件")
-    parser.add_argument("contact", help="联系人备注/昵称（支持部分匹配）")
+    parser = argparse.ArgumentParser(
+        description="导出微信单聊记录为文本文件",
+        epilog="示例: python export_chat.py 张三 -i --since 2024-01-01")
+    parser.add_argument("contact", nargs="?",
+                        help="联系人备注/昵称（支持部分匹配）；配合 --all 时作为过滤词")
     parser.add_argument("-o", "--output", help="输出文件路径（默认 export/<联系人>_chat.txt，增量模式默认 export/<联系人>.txt）")
     parser.add_argument("-d", "--decrypted-dir", help="已解密数据库目录")
     parser.add_argument("-i", "--incremental", action="store_true",
                         help="增量导出：追加到 export/<联系人>.txt，只写入比文件中最后一条更新的消息")
+    parser.add_argument("--list", nargs="?", const="", metavar="过滤词", dest="list_filter",
+                        help="列出有单聊记录的联系人（消息数、最后消息日期），可选按名称过滤")
+    parser.add_argument("--all", action="store_true",
+                        help="增量导出所有单聊到 export/<联系人>.txt")
+    parser.add_argument("--since", type=_parse_date, metavar="YYYY-MM-DD",
+                        help="只导出该日期（含）之后的消息")
+    parser.add_argument("--until", type=_parse_date, metavar="YYYY-MM-DD",
+                        help="只导出该日期（含）之前的消息")
+    parser.add_argument("--export-dir", help="导出目录（默认: 项目下的 export/）")
+    parser.add_argument("--no-decrypt", action="store_true", help="跳过自动解密，直接使用现有解密数据")
     args = parser.parse_args(argv)
 
-    # 自动解密（跳过未变化的数据库）
-    from decrypt_db import main as decrypt_main
-    decrypt_main()
+    if args.list_filter is None and not args.all and not args.contact:
+        parser.error("请指定联系人，或使用 --list / --all")
+    if args.all and args.output:
+        parser.error("--all 不能与 -o 同时使用（请用 --export-dir）")
+
+    since = args.since.timestamp() if args.since else None
+    until = (args.until + timedelta(days=1)).timestamp() if args.until else None
+    if since is not None and until is not None and since >= until:
+        parser.error("--since 不能晚于 --until")
+
+    if not args.no_decrypt:
+        # 自动解密（跳过未变化的数据库）
+        from decrypt_db import main as decrypt_main
+        decrypt_main()
 
     decrypted_dir = args.decrypted_dir or DEFAULT_DECRYPTED_DIR
+    export_dir = os.path.abspath(args.export_dir) if args.export_dir else DEFAULT_EXPORT_DIR
     if not message_db_paths(decrypted_dir):
         print(f"[!] 未找到消息数据库目录: {os.path.join(decrypted_dir, 'message')}")
         return 1
+
+    if args.list_filter is not None:
+        cmd_list(args.list_filter or args.contact, decrypted_dir)
+        return 0
+    if args.all:
+        cmd_all(args.contact, decrypted_dir, export_dir, since, until)
+        return 0
 
     remark_name, wxid = resolve_contact(args.contact, decrypted_dir)
     if not remark_name:
         return 1
     print(f"[+] 目标 wxid: {wxid}")
-    export_contact(wxid, remark_name, args.output, decrypted_dir, args.incremental)
+    export_contact(wxid, remark_name, args.output, decrypted_dir, args.incremental,
+                   since, until, export_dir)
     return 0
 
 
