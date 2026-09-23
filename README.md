@@ -64,6 +64,27 @@
 - **图片**：解码微信 4.x 加密的 `.dat` 图片（包括基于 HEVC 的 wxgf 格式，用 macOS 自带的 `sips` 转为 JPEG）。图片密钥从本地账号文件推导，不需要额外的 `sudo`。如果微信只有缩略图（原图从未下载），先使用缩略图，之后原图出现时再次导出会自动替换
 - **旧的增量格式**：如果之前用过 `export/<名称>/output_N.txt` 格式，第一次增量导出时会把这些文件合并到 `export/<名称>.txt`，之后可以删除旧文件夹
 
+## 自动备份
+
+```bash
+./wechat backup              # 立即备份一次：解密有变化的数据库 + 增量导出全部聊天
+./wechat backup --install    # 安装每日定时任务（默认 03:30）
+./wechat backup --status     # 是否已安装、下次运行时间、上次运行结果
+./wechat backup --uninstall  # 卸载
+```
+
+- **从不使用 sudo**：只用 `all_keys.json` 里现有的密钥。密钥缺失或过期的数据库会被跳过（导出使用上次解密的数据），并弹出通知提醒你手动运行 `./wechat decrypt`。
+- 按 `config.json` 的 `backup` 配置（均可省略，下面是默认值）对每种格式运行一次 `--all -i`：
+  ```json
+  "backup": {"formats": ["html", "txt"], "media": true, "dir": "export", "time": "03:30"}
+  ```
+  `media` 为 true 时导出图片（导出命令支持 `--media` 时用 `--media`，否则用 `--images`）；`dir` 可用 `--dir` 或环境变量 `WECHAT_BACKUP_DIR` 临时覆盖；修改 `time` 后需重新 `--install`。
+- 每次运行在 `logs/backup.jsonl` 追加一行摘要（时间、耗时、更新的聊天数、新增消息数、跳过的数据库、错误），不含消息内容。定时任务的输出在 `~/Library/Logs/wechat-decrypt-export/backup.log`。
+- 只在失败或需要手动提取密钥时发送 macOS 通知；成功时不打扰。有锁文件，不会重叠运行。
+- 退出码：0 成功，1 失败，2 配置错误，3 已有备份在运行，4 完成但有数据库需要新密钥。
+- 定时任务是 LaunchAgent（`~/Library/LaunchAgents/local.wechat-decrypt-export.backup.plist`），以低优先级运行；屏幕锁定时照常运行（只读写文件）。到点时电脑在睡眠，会在**唤醒后补跑**一次（错过多次也只补一次）；关机或未登录时不运行。
+- **权限**：由 launchd 启动时，macOS 要求单独授权读取微信的数据（终端的授权不适用）。请在 系统设置 > 隐私与安全性 > **完全磁盘访问权限** 中添加 `--install` 打印的 Python 路径（Homebrew 升级 Python 后需重新添加），然后用 `launchctl kickstart gui/$(id -u)/local.wechat-decrypt-export.backup` 试运行、`./wechat backup --status` 查看结果。没有权限时备份不会卡在授权弹窗上：约 45 秒后放弃解密，只导出已解密的数据，并发送通知。
+
 ## 配置
 
 无需配置：首次运行时会自动检测微信数据目录并保存到 `config.json`（有多个账号时让你选择），你自己的微信 ID 从目录名自动推导。如需手动指定，编辑 `config.json`：
@@ -96,9 +117,10 @@ WCDB（微信的 SQLCipher 封装层）会在进程内存中缓存派生后的�
 | 文件 | 说明 |
 |------|------|
 | `setup.sh` | 一次性环境配置（venv、扫描器、微信签名） |
-| `wechat` | 启动脚本：`./wechat …` 导出，`./wechat decrypt` 解密 |
+| `wechat` | 启动脚本：`./wechat …` 导出，`./wechat decrypt` 解密，`./wechat backup` 备份 |
 | `find_all_keys_macos.c` | C 源码 — 通过 Mach VM API 扫描微信进程内存提取 SQLCipher 密钥 |
 | `decrypt_db.py` | 解密有变化的数据库；密钥缺失或过期时自动提取 |
+| `backup.py` | 无人值守备份（`./wechat backup`）与定时任务安装 |
 | `export_chat.py` | 命令行：搜索、列出、导出 |
 | `chats.py` | 聊天发现、联系人、群成员名称、消息解析 |
 | `formatters.py` | txt / md / html / json / csv 输出 |
