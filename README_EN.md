@@ -70,6 +70,27 @@ What the exporter handles:
 - **Voice / video**: voice messages (SILK v3 stored in `message/media_0.db`) are decoded with the `silk-python` package and encoded to AAC `.m4a` with macOS's built-in `afconvert` (WAV if unavailable). Videos WeChat has downloaded are plain MP4s and are copied (an APFS clone on the same volume, so no extra space); videos never downloaded show their thumbnail. Durations come from the message. Already exported files are reused, so incremental exports only convert new messages. Audio/video use `preload="none"` so large HTML pages open quickly
 - **Old incremental layout**: if you used the previous `export/<name>/output_N.txt` layout, the first incremental export merges those files into `export/<name>.txt`; the old folder can then be deleted
 
+## Automatic backup
+
+```bash
+./wechat backup              # back up now: decrypt changed DBs + incremental export of every chat
+./wechat backup --install    # install the daily LaunchAgent (default 03:30)
+./wechat backup --status     # installed? next run, last run summary
+./wechat backup --uninstall
+```
+
+- **Never uses sudo**: only the keys already in `all_keys.json`. DBs whose key is missing or stale are skipped (the export uses the last decrypted copy) and a notification asks you to run `./wechat decrypt` by hand.
+- Runs `--all -i` once per format from the optional `backup` section of `config.json` (defaults shown):
+  ```json
+  "backup": {"formats": ["html", "txt"], "media": true, "dir": "export", "time": "03:30"}
+  ```
+  `media` exports images (`--media` if the export CLI has it, otherwise `--images`); `dir` can be overridden with `--dir` or `WECHAT_BACKUP_DIR`; re-run `--install` after changing `time`.
+- Each run appends one line to `logs/backup.jsonl` (time, duration, chats updated, messages added, skipped DBs, errors; no message content). Scheduled output goes to `~/Library/Logs/wechat-decrypt-export/backup.log`.
+- macOS notification only on failure or when keys need a manual `./wechat decrypt`. A lock file prevents overlapping runs.
+- Exit codes: 0 ok, 1 failed, 2 config error, 3 another run in progress, 4 done but some DBs need new keys.
+- Low-priority LaunchAgent (`~/Library/LaunchAgents/local.wechat-decrypt-export.backup.plist`); runs while the screen is locked (files only). If the Mac is asleep at the scheduled time, launchd runs the job **once after wake** (missed runs are coalesced); it does not run while shut down or logged out.
+- **Permission**: when started by launchd, macOS requires its own grant to read WeChat's data (Terminal's grant does not apply). Add the Python path printed by `--install` under System Settings > Privacy & Security > **Full Disk Access** (again after a Homebrew Python upgrade), then test with `launchctl kickstart gui/$(id -u)/local.wechat-decrypt-export.backup` and `./wechat backup --status`. Without it the backup does not hang on the consent prompt: after ~45 s it skips decryption, exports the already-decrypted data and notifies you.
+
 ## Configuration
 
 Nothing to configure: on first run the WeChat data folder is auto-detected and saved to `config.json` (you pick one if there are several accounts), and your own WeChat ID is derived from the folder name. To override, edit `config.json`:
@@ -102,9 +123,10 @@ Each chat's messages live in tables named `Msg_<md5(username)>`; message content
 | File | Purpose |
 |------|---------|
 | `setup.sh` | One-time environment setup (venv, scanner, WeChat signing) |
-| `wechat` | Launcher: `./wechat …` → export, `./wechat decrypt` → decrypt |
+| `wechat` | Launcher: `./wechat …` → export, `./wechat decrypt` → decrypt, `./wechat backup` → backup |
 | `find_all_keys_macos.c` | C — scans WeChat process memory for SQLCipher keys (Mach VM API) |
 | `decrypt_db.py` | Decrypts changed databases; extracts keys automatically when missing or stale |
+| `backup.py` | Unattended backup (`./wechat backup`) and LaunchAgent install |
 | `export_chat.py` | Command line: search, list, export |
 | `chats.py` | Chat discovery, contacts, group sender names, message parsing |
 | `formatters.py` | txt / md / html / json / csv writers |

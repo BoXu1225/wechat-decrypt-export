@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# wechat - run export_chat.py (or `wechat decrypt` -> decrypt_db.py) with the repo's venv,
-# from any directory. Can be symlinked into e.g. ~/bin.
+# wechat - run export_chat.py (or `wechat decrypt` -> decrypt_db.py, `wechat backup` -> backup.py)
+# with the repo's venv, from any directory. Can be symlinked into e.g. ~/bin.
 set -euo pipefail
 
 src="${BASH_SOURCE[0]}"
@@ -17,6 +17,10 @@ if [[ ! -x "$PY" ]]; then
     exit 1
 fi
 
+if [[ "${1:-}" == "backup" ]]; then
+    shift
+    exec "$PY" "$ROOT/backup.py" "$@"
+fi
 if [[ "${1:-}" == "decrypt" ]]; then
     shift
     exec "$PY" "$ROOT/decrypt_db.py" "$@"

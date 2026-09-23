@@ -2,5 +2,6 @@
     "db_dir": "/Users/YOU/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/YOUR_WXID/db_storage",
     "keys_file": "all_keys.json",
     "decrypted_dir": "decrypted",
-    "wechat_process": "WeChat"
+    "wechat_process": "WeChat",
+    "backup": {"formats": ["html", "txt"], "media": true, "dir": "export", "time": "03:30"}
 }
