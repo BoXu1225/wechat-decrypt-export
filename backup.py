@@ -635,8 +635,9 @@ def build_parser():
 def resolve_config(args, raw=None, env=None):
     env = os.environ if env is None else env
     raw = read_raw_config() if raw is None else raw
-    b = dict(raw.get("backup") or {}) if isinstance(raw.get("backup"), dict) else raw.get("backup")
-    if isinstance(b, dict):
+    b = raw.get("backup")
+    b = {} if b is None else dict(b) if isinstance(b, dict) else b
+    if isinstance(b, dict):   # 否则交给 load_backup_config 报错
         if env.get("WECHAT_BACKUP_DIR"):
             b["dir"] = env["WECHAT_BACKUP_DIR"]
         if args.dir:

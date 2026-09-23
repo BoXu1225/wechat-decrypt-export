@@ -115,6 +115,10 @@ class ConfigTest(unittest.TestCase):
         cfg = B.resolve_config(args, raw, env={"WECHAT_BACKUP_DIR": "/env"})
         self.assertEqual((cfg["dir"], cfg["formats"], cfg["media"]), ("/flag", ["txt", "csv"], False))
         self.assertEqual(raw, {"backup": {"dir": "/from/config", "formats": ["md"]}})  # not mutated
+        # No "backup" section in config.json at all: flags / env still apply.
+        self.assertEqual(B.resolve_config(args, {"db_dir": "x"}, env={})["dir"], "/flag")
+        args = B.build_parser().parse_args([])
+        self.assertEqual(B.resolve_config(args, {}, env={"WECHAT_BACKUP_DIR": "/env"})["dir"], "/env")
 
     def test_main_config_error_exit_code(self):
         with mock.patch.object(B, "read_raw_config", return_value={"backup": {"time": "99:99"}}), \
