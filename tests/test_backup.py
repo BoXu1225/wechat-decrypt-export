@@ -410,9 +410,12 @@ class ParseOutputTest(unittest.TestCase):
 
 class PlistTest(unittest.TestCase):
     def test_plist(self):
-        pl = plistlib.loads(B.build_plist(3, 30, python="/r/venv/bin/python", root="/r"))
+        pl = plistlib.loads(B.build_plist(3, 30, app="/A/WeChatBackup.app", root="/r"))
         self.assertEqual(pl["Label"], "local.wechat-decrypt-export.backup")
-        self.assertEqual(pl["ProgramArguments"], ["/r/venv/bin/python", "/r/backup.py", "--scheduled"])
+        # The launcher app, not python: macOS attributes the data access to the app.
+        self.assertEqual(pl["ProgramArguments"], ["/A/WeChatBackup.app/Contents/MacOS/WeChatBackup"])
+        self.assertEqual(pl["AssociatedBundleIdentifiers"], ["local.wechat-decrypt-export.backup"])
+        self.assertNotIn("EnvironmentVariables", pl)
         self.assertEqual(pl["StartCalendarInterval"], {"Hour": 3, "Minute": 30})
         self.assertEqual(pl["ProcessType"], "Background")
         self.assertGreater(pl["Nice"], 0)
@@ -422,7 +425,7 @@ class PlistTest(unittest.TestCase):
         log = os.path.expanduser("~/Library/Logs/wechat-decrypt-export/backup.log")
         self.assertEqual((pl["StandardOutPath"], pl["StandardErrorPath"]), (log, log))
         self.assertNotIn("--dir", pl["ProgramArguments"])
-        pl = plistlib.loads(B.build_plist(23, 5, export_dir="/x y/bk", python="p", root="/r"))
+        pl = plistlib.loads(B.build_plist(23, 5, export_dir="/x y/bk", app="/A/W.app", root="/r"))
         self.assertEqual(pl["ProgramArguments"][-2:], ["--dir", "/x y/bk"])
         self.assertEqual(pl["StartCalendarInterval"], {"Hour": 23, "Minute": 5})
 
@@ -446,16 +449,81 @@ class PlistTest(unittest.TestCase):
         cfg = B.load_backup_config({})
         with mock.patch.object(B, "PLIST_PATH", plist), \
                 mock.patch.object(B, "LAUNCHD_LOG_DIR", os.path.join(tmp, "Logs")), \
-                mock.patch.object(B, "_launchctl", fake_launchctl), quiet():
+                mock.patch.object(B, "_launchctl", fake_launchctl), \
+                mock.patch.object(B, "INSTALLED_APP", os.path.join(tmp, "Apps", "WeChatBackup.app")), \
+                mock.patch.object(B, "install_app", return_value=(True, False)) as inst, quiet():
             self.assertEqual(B.install(cfg), 0)
             self.assertEqual(B.install(cfg), 0)
             verbs = [c[0] for c in calls if c[0] != "print"]
             self.assertEqual(verbs, ["bootout", "bootstrap", "bootout", "bootstrap"])
             self.assertEqual(plistlib.loads(read(plist, "rb"))["StartCalendarInterval"],
                              {"Hour": 3, "Minute": 30})
+            self.assertEqual(inst.call_count, 2)
+            os.makedirs(B.INSTALLED_APP)
             B.uninstall()
             self.assertFalse(os.path.exists(plist))
             self.assertFalse(loaded["v"])
+            self.assertFalse(os.path.exists(B.INSTALLED_APP))
+        with mock.patch.object(B, "install_app", return_value=(False, False)), quiet():
+            self.assertEqual(B.install(cfg), B.EXIT_FAIL)   # build failure: nothing loaded
+
+
+@unittest.skipUnless(sys.platform == "darwin" and os.path.exists("/usr/bin/cc"), "needs macOS cc")
+class LauncherTest(unittest.TestCase):
+    """launcher/main.c compiled against a fake repo whose venv python is a shell script."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="launcher_")
+        cls.repo = os.path.join(cls.tmp, "repo")
+        os.makedirs(os.path.join(cls.repo, "venv", "bin"))
+        cls.out = os.path.join(cls.tmp, "out.txt")
+        py = os.path.join(cls.repo, "venv", "bin", "python")
+        with open(py, "w") as f:
+            f.write(f"""#!/bin/sh
+{{ echo "cwd=$(pwd -P)"; for a in "$@"; do echo "arg=$a"; done; env | sort; }} > {cls.out}
+echo to-stdout; echo to-stderr >&2
+exit ${{FAKE_EXIT:-7}}
+""")
+        os.chmod(py, 0o755)
+        cls.exe = os.path.join(cls.tmp, "WeChatBackup")
+        src = os.path.join(os.path.dirname(HERE), "launcher", "main.c")
+        subprocess.run(["/usr/bin/cc", "-O2", "-Wall", "-Wextra", "-Werror",
+                        f'-DREPO_ROOT="{cls.repo}"', "-o", cls.exe, src], check=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp)
+
+    def run_exe(self, *args):
+        env = {"PATH": "/usr/bin:/bin", "HOME": os.environ.get("HOME", "/"),
+               "PYTHONPATH": "/evil", "PYTHONSTARTUP": "/evil.py", "FAKE_EXIT": "0"}
+        return subprocess.run([self.exe, *args], capture_output=True, text=True, env=env)
+
+    def test_runs_fixed_command_as_child(self):
+        p = self.run_exe()
+        self.assertEqual(p.returncode, 7)              # child's exit code forwarded
+        self.assertEqual((p.stdout, p.stderr), ("to-stdout\n", "to-stderr\n"))
+        out = read(self.out).splitlines()
+        args = [line[4:] for line in out if line.startswith("arg=")]
+        self.assertEqual(args, ["-E", "-s", os.path.join(self.repo, "backup.py"), "--scheduled"])
+        self.assertIn(f"cwd={os.path.realpath(self.repo)}", out)
+        env = "\n".join(out)
+        for bad in ("PYTHONPATH", "PYTHONSTARTUP", "FAKE_EXIT"):
+            self.assertNotIn(bad + "=", env)           # environment is not passed through
+        self.assertIn("PYTHONIOENCODING=utf-8", env)
+
+    def test_dir_argument(self):
+        self.assertEqual(self.run_exe("--dir", "/x y/bk").returncode, 7)
+        args = [line[4:] for line in read(self.out).splitlines() if line.startswith("arg=")]
+        self.assertEqual(args[-2:], ["--dir", "/x y/bk"])
+
+    def test_rejects_other_arguments(self):
+        os.remove(self.out) if os.path.exists(self.out) else None
+        for argv in (["--dir", "relative"], ["-c", "print(1)"], ["--dir"], ["x", "y", "z"]):
+            with self.subTest(argv=argv):
+                self.assertEqual(self.run_exe(*argv).returncode, 2)
+        self.assertFalse(os.path.exists(self.out))    # child never started
 
     def test_next_run(self):
         now = dt.datetime(2026, 9, 23, 2, 0)

@@ -57,10 +57,13 @@ jobs:
         if: hashFiles('helper/build.sh') != ''
         run: bash helper/build.sh --force
 
+      - name: Build backup launcher app
+        run: bash launcher/build.sh --force
+
       - name: Install shellcheck
         run: command -v shellcheck >/dev/null || brew install shellcheck
 
       - name: shellcheck
         run: |
           shopt -s nullglob
-          shellcheck setup.sh wechat helper/*.sh
+          shellcheck setup.sh wechat helper/*.sh launcher/*.sh

@@ -27,8 +27,11 @@ config.json 中的可选配置（以下为默认值）:
 跳过的数据库、错误），不含任何消息内容或聊天名称。
 
 密钥缺失或过期时绝不提权：对应数据库跳过（导出使用上次解密的数据），并发送一条通知。
-只读写文件，不需要图形界面，屏幕锁定时也能运行。由 launchd 启动时需要为 Python 授予
-「完全磁盘访问权限」才能读取微信数据目录；没有权限时不会卡在授权弹窗上（预检超时即放弃并通知）。
+只读写文件，不需要图形界面，屏幕锁定时也能运行。
+
+定时任务通过 ~/Applications/WeChatBackup.app（launcher/，只能运行本仓库的 backup.py）启动；
+macOS 把读取微信数据的权限归属到这个 app，所以只需为它授予「完全磁盘访问权限」，
+而不是为 Python 解释器授权。没有权限时不会卡在授权弹窗上（预检超时即放弃并通知）。
 """
 import argparse
 import contextlib
@@ -40,6 +43,7 @@ import json
 import os
 import plistlib
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -58,6 +62,15 @@ LABEL = "local.wechat-decrypt-export.backup"
 PLIST_PATH = os.path.expanduser(f"~/Library/LaunchAgents/{LABEL}.plist")
 LAUNCHD_LOG_DIR = os.path.expanduser("~/Library/Logs/wechat-decrypt-export")
 LAUNCHD_LOG = os.path.join(LAUNCHD_LOG_DIR, "backup.log")
+
+# 定时任务的启动器 app（见 launcher/）：macOS 按它（而不是 Python）授予完全磁盘访问权限
+APP_NAME = "WeChatBackup"
+BUNDLE_ID = LABEL
+LAUNCHER_BUILD = os.path.join(ROOT, "launcher", "build.sh")
+BUILT_APP = os.path.join(ROOT, "launcher", "build", f"{APP_NAME}.app")
+INSTALLED_APP = os.path.expanduser(f"~/Applications/{APP_NAME}.app")
+GRANT_STEPS = ("系统设置 > 隐私与安全性 > 完全磁盘访问权限 > 点「+」> 按 ⌘⇧G 输入 "
+               f"~/Applications/{APP_NAME}.app > 打开，并确认开关已打开")
 
 ALL_FORMATS = ("txt", "md", "html", "json", "csv")
 DEFAULTS = {"formats": ["html", "txt"], "media": True, "dir": "export", "time": "03:30"}
@@ -281,11 +294,6 @@ for root, dirs, files in os.walk(d):
 """
 
 
-def python_real_path():
-    """实际运行的 Python 可执行文件（macOS 隐私权限按它授予，而不是 venv 里的软链接）。"""
-    return os.path.realpath(python_bin())
-
-
 def check_data_access(db_dir, runner=subprocess.run, timeout=None):
     """在子进程中试读微信数据目录。可读返回 None，否则返回 "denied" / "timeout"。
 
@@ -422,7 +430,7 @@ def notification_text(entry):
     """需要通知时返回文本，否则返回 None（成功时不打扰）。"""
     parts = []
     if entry.get("access"):
-        parts.append("无法读取微信数据（macOS 隐私权限），请在「完全磁盘访问权限」中添加 Python，"
+        parts.append(f"无法读取微信数据（macOS 隐私权限），请在「完全磁盘访问权限」中添加 {APP_NAME}，"
                      "详见 ./wechat backup --status")
     elif entry["status"] == "error":
         parts.append(f"备份失败（{len(entry['errors'])} 个错误），详见 logs/backup.jsonl")
@@ -480,7 +488,7 @@ def run_backup(cfg, *, notify_enabled=True, verbose=False, trigger="manual",
         entry["errors"].append(
             "无法读取微信数据目录（macOS 隐私权限"
             + ("，读取被授权对话框阻塞" if entry.get("access") == "timeout" else "")
-            + f"）: 请在 系统设置 > 隐私与安全性 > 完全磁盘访问权限 中添加 {python_real_path()}")
+            + f"）: 请为 {APP_NAME}.app 授权: {GRANT_STEPS}")
         print("[!] " + entry["errors"][-1])
         print("[!] 跳过解密和媒体导出，只用上次解密的数据导出文字记录")
     except Exception as e:
@@ -534,9 +542,14 @@ def run_backup(cfg, *, notify_enabled=True, verbose=False, trigger="manual",
 # LaunchAgent
 # ---------------------------------------------------------------------------
 
-def build_plist(hour, minute, export_dir=None, python=None, root=ROOT):
-    """生成 LaunchAgent plist（bytes）。export_dir 只在明确指定时写入参数。"""
-    args = [python or python_bin(), os.path.join(root, "backup.py"), "--scheduled"]
+def app_executable(app=None):
+    return os.path.join(app or INSTALLED_APP, "Contents", "MacOS", APP_NAME)
+
+
+def build_plist(hour, minute, export_dir=None, app=None, root=ROOT):
+    """生成 LaunchAgent plist（bytes）。程序是启动器 app（它以子进程运行 backup.py --scheduled）；
+    export_dir 只在明确指定时写入参数。"""
+    args = [app_executable(app)]
     if export_dir:
         args += ["--dir", export_dir]
     d = {
@@ -550,8 +563,7 @@ def build_plist(hour, minute, export_dir=None, python=None, root=ROOT):
         "LowPriorityIO": True,
         "StandardOutPath": LAUNCHD_LOG,
         "StandardErrorPath": LAUNCHD_LOG,
-        "EnvironmentVariables": {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "en_US.UTF-8",
-                                 "PYTHONIOENCODING": "utf-8"},
+        "AssociatedBundleIdentifiers": [BUNDLE_ID],
     }
     return plistlib.dumps(d)
 
@@ -578,7 +590,51 @@ def _bootout():
         time.sleep(0.25)
 
 
+def _cdhash(app):
+    p = subprocess.run(["/usr/bin/codesign", "-dvvv", app], capture_output=True, text=True)
+    m = re.search(r"^CDHash=(\w+)", p.stderr, re.M)
+    return m.group(1) if m else None
+
+
+def install_app(runner=subprocess.run):
+    """构建（仅在源码变化时）并安装 ~/Applications/WeChatBackup.app。
+    已安装的 app 只在构建结果不同时替换，这样完全磁盘访问权限在重复安装后仍然有效。
+    返回 (成功, 是否替换了 app)。"""
+    p = runner(["/bin/bash", LAUNCHER_BUILD], capture_output=True, text=True)
+    if p.returncode != 0:
+        print(f"[!] 构建 {APP_NAME}.app 失败:\n{(p.stdout or '') + (p.stderr or '')}".rstrip())
+        return False, False
+    if os.path.isdir(INSTALLED_APP) and _cdhash(INSTALLED_APP) == _cdhash(BUILT_APP):
+        return True, False
+    os.makedirs(os.path.dirname(INSTALLED_APP), exist_ok=True)
+    tmp = INSTALLED_APP + ".new"
+    shutil.rmtree(tmp, ignore_errors=True)
+    subprocess.run(["/usr/bin/ditto", BUILT_APP, tmp], check=True)
+    shutil.rmtree(INSTALLED_APP, ignore_errors=True)
+    os.replace(tmp, INSTALLED_APP)
+    return True, True
+
+
+def app_repo_ok(app=None):
+    """已安装的 app 是否为本仓库构建（仓库路径编译在可执行文件中）。"""
+    try:
+        with open(app_executable(app), "rb") as f:
+            return (ROOT + "/backup.py").encode() in f.read()
+    except OSError:
+        return False
+
+
+def print_grant_steps():
+    print(f"    首次安装（或 {APP_NAME}.app 被重新构建后）需要授权它读取微信数据:")
+    print(f"      {GRANT_STEPS}")
+    print(f"    只授权给 {APP_NAME}.app（它只能运行本仓库的 backup.py），不要授权给 Python 或终端。")
+
+
 def install(cfg, export_dir=None):
+    ok, replaced = install_app()
+    if not ok:
+        return EXIT_FAIL
+    print(f"[+] {APP_NAME}.app {'已安装/更新' if replaced else '未变化'}: {INSTALLED_APP}")
     os.makedirs(LAUNCHD_LOG_DIR, exist_ok=True)
     os.makedirs(os.path.dirname(PLIST_PATH), exist_ok=True)
     data = build_plist(cfg["hour"], cfg["minute"], export_dir)
@@ -596,12 +652,11 @@ def install(cfg, export_dir=None):
     print(f"    导出目录: {export_dir or cfg['dir']}，格式: {', '.join(cfg['formats'])}")
     print(f"    日志: {LAUNCHD_LOG}，摘要: {SUMMARY_FILE}")
     print("    电脑在该时间处于睡眠时，会在唤醒后补跑一次；关机或未登录时不会运行。")
-    print("    立即试运行: launchctl kickstart " + f"{_domain()}/{LABEL}")
     print("[!] 由 launchd 启动时，macOS 要求单独授权读取微信的数据（终端里的授权不适用）。")
-    print("    请在 系统设置 > 隐私与安全性 > 完全磁盘访问权限 中点 +，按 ⌘⇧G 输入下面的路径并添加:")
-    print(f"      {python_real_path()}")
-    print("    （或在试运行时弹出的「想访问其他 App 的数据」对话框中点「允许」。"
-          "Homebrew 升级 Python 后路径会变化，需要重新添加）")
+    print_grant_steps()
+    if replaced:
+        print(f"    （本次安装了新构建的 {APP_NAME}.app：如果之前已授权，请在列表中用「-」删除旧条目后重新添加）")
+    print(f"    授权后试运行: launchctl kickstart {_domain()}/{LABEL}，再用 ./wechat backup --status 查看结果")
     return EXIT_OK
 
 
@@ -611,6 +666,10 @@ def uninstall():
     if os.path.exists(PLIST_PATH):
         os.remove(PLIST_PATH)
     print("[+] 已卸载定时备份" if was else "[+] 定时备份未安装")
+    if os.path.isdir(INSTALLED_APP):
+        shutil.rmtree(INSTALLED_APP)
+        print(f"[+] 已删除 {INSTALLED_APP}")
+        print(f"    可在 系统设置 > 隐私与安全性 > 完全磁盘访问权限 中用「-」删除 {APP_NAME} 条目")
     return EXIT_OK
 
 
@@ -652,8 +711,15 @@ def status(cfg):
             print(f"  导出目录: {d}")
             if (h, m) != (cfg["hour"], cfg["minute"]):
                 print(f"  [!] config.json 中的时间为 {cfg['time']}，请重新运行 ./wechat backup --install")
-            if len(args) > 1 and os.path.dirname(os.path.abspath(args[1])) != ROOT:
-                print(f"  [!] 定时任务指向另一个目录: {os.path.dirname(args[1])}")
+            exe = args[0] if args else ""
+            app = os.path.dirname(os.path.dirname(os.path.dirname(exe)))
+            if not os.path.exists(exe):
+                print(f"  [!] 启动器不存在: {exe}，请重新运行 ./wechat backup --install")
+            else:
+                print(f"  启动器: {app}")
+                if not app_repo_ok(app):
+                    print(f"  [!] {APP_NAME}.app 是为另一个仓库目录构建的，请在本目录重新运行 ./wechat backup --install")
+            print(f"  权限: 需要为 {APP_NAME}.app 授予完全磁盘访问权限（{GRANT_STEPS}）")
         except Exception as e:
             print(f"  [!] 无法读取 plist: {e}")
     last = last_summary()
@@ -666,9 +732,9 @@ def status(cfg):
         for e in last.get("errors") or []:
             print(f"  [!] {e}")
         if last.get("access"):
-            print(f"  [!] 定时任务没有读取微信数据的权限: 请把 {python_real_path()} 加入"
-                  "「完全磁盘访问权限」，然后运行 launchctl kickstart "
-                  f"{_domain()}/{LABEL} 验证")
+            print("  [!] 定时任务没有读取微信数据的权限:")
+            print(f"      {GRANT_STEPS}")
+            print(f"      然后运行 launchctl kickstart {_domain()}/{LABEL} 验证")
     else:
         print("上次运行: 无记录")
     return EXIT_OK
