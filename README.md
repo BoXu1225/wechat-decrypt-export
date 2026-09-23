@@ -32,27 +32,20 @@ WCDB（微信的 SQLCipher 封装层）会在进程内存中缓存派生后的�
 
 ## 快速开始
 
-### 1. 提取加密密钥
+只需一条命令，首次运行会自动完成所有准备工作：
 
 ```bash
-# 编译（仅需一次）
-cc -O2 -o find_all_keys_macos find_all_keys_macos.c -framework Foundation
-
-# 运行（微信必须打开，需要 root 权限）
-sudo ./find_all_keys_macos
+python export_chat.py ning
 ```
 
-输出 `all_keys.json`，包含每个数据库与其加密密钥的映射。
+它会依次：
+1. **提取密钥** — 首次运行、出现新数据库或密钥过期时，自动编译并运行 `find_all_keys_macos`（需要输入 sudo 密码，微信必须打开）
+2. **解密数据库** — 解密到 `decrypted/`，只处理有变化的数据库，并进行 HMAC 校验和 SQLite 完整性检查
+3. **导出聊天记录**
 
-### 2. 解密数据库
+也可以单独运行解密：`python decrypt_db.py`
 
-```bash
-python decrypt_db.py
-```
-
-将所有数据库解密到 `decrypted/` 目录。每个数据库会进行 HMAC 校验和 SQLite 完整性检查。
-
-### 3. 导出聊天记录
+### 导出选项
 
 ```bash
 # 模糊搜索联系人（支持部分匹配，多个结果时交互选择）

@@ -26,11 +26,94 @@ DB_DIR = _cfg["db_dir"]
 OUT_DIR = _cfg["decrypted_dir"]
 KEYS_FILE = _cfg["keys_file"]
 
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+SCANNER_SRC = os.path.join(PROJECT_ROOT, "find_all_keys_macos.c")
+SCANNER_BIN = os.path.join(PROJECT_ROOT, "find_all_keys_macos")
+
+
+def list_db_files():
+    """返回 db_dir 下所有数据库的相对路径（统一正斜杠）"""
+    rels = []
+    for root, dirs, files in os.walk(DB_DIR):
+        for f in files:
+            if f.endswith('.db'):
+                rels.append(os.path.relpath(os.path.join(root, f), DB_DIR).replace('\\', '/'))
+    return rels
+
+
+def load_keys():
+    if not os.path.exists(KEYS_FILE):
+        return {}
+    with open(KEYS_FILE) as f:
+        keys = json.load(f)
+    keys.pop("_db_dir", None)
+    return keys
+
+
+def run_key_scanner():
+    """编译（如需要）并以 root 运行内存密钥扫描器，生成 all_keys.json"""
+    import subprocess
+    if (not os.path.exists(SCANNER_BIN)
+            or os.path.getmtime(SCANNER_BIN) < os.path.getmtime(SCANNER_SRC)):
+        print("编译密钥扫描器 ...")
+        subprocess.run(["cc", "-O2", "-o", SCANNER_BIN, SCANNER_SRC,
+                        "-framework", "Foundation"], check=True)
+    print("提取密钥需要 root 权限（微信必须正在运行，且已 ad-hoc 签名）")
+    subprocess.run(["sudo", SCANNER_BIN], cwd=PROJECT_ROOT, check=True)
+
+
+def ensure_keys():
+    """密钥文件缺失，或自上次提取后有数据库新增/变化且没有可用密钥时，自动运行扫描器"""
+    keys = load_keys()
+    last_scan = os.path.getmtime(KEYS_FILE) if keys else 0
+    # 缺少密钥或密钥已过期（数据库被重建、salt 改变）。
+    # 只看上次提取后有变化的数据库，避免对扫描器找不到密钥的库反复要求 sudo
+    missing = [r for r in list_db_files()
+               if os.path.getmtime(os.path.join(DB_DIR, r)) > last_scan
+               and (r not in keys or not key_is_valid(r, keys[r]["enc_key"]))]
+    if keys and not missing:
+        return keys
+    if keys:
+        print(f"{len(missing)} 个数据库缺少密钥或密钥已过期（例如 {missing[0]}），重新提取 ...")
+    else:
+        print(f"未找到密钥文件 {KEYS_FILE}，开始提取 ...")
+    try:
+        run_key_scanner()
+    except Exception as e:
+        print(f"[ERROR] 密钥提取失败: {e}")
+        if not keys:
+            sys.exit(1)
+
+    # 扫描器会覆盖密钥文件：保留本次没扫到、但仍然有效的旧密钥。
+    # 写回同时刷新文件时间，本次仍未找到密钥的库不会在下次运行时再触发扫描
+    new_keys = load_keys()
+    for rel, entry in keys.items():
+        if rel not in new_keys and os.path.exists(os.path.join(DB_DIR, rel)) \
+                and key_is_valid(rel, entry["enc_key"]):
+            new_keys[rel] = entry
+    with open(KEYS_FILE, "w") as f:
+        json.dump(new_keys, f, indent=2)
+    return new_keys
+
 
 def derive_mac_key(enc_key, salt):
     """从enc_key派生HMAC密钥"""
     mac_salt = bytes(b ^ 0x3a for b in salt)
     return hashlib.pbkdf2_hmac("sha512", enc_key, mac_salt, 2, dklen=KEY_SZ)
+
+
+def page1_hmac_ok(page1, enc_key):
+    """用 page 1 的 HMAC 校验密钥是否匹配该数据库"""
+    mac_key = derive_mac_key(enc_key, page1[:SALT_SZ])
+    hm = hmac_mod.new(mac_key, page1[SALT_SZ : PAGE_SZ - RESERVE_SZ + IV_SZ], hashlib.sha512)
+    hm.update(struct.pack('<I', 1))
+    return hm.digest() == page1[PAGE_SZ - HMAC_SZ : PAGE_SZ]
+
+
+def key_is_valid(rel, enc_key_hex):
+    with open(os.path.join(DB_DIR, rel), 'rb') as f:
+        page1 = f.read(PAGE_SZ)
+    return len(page1) == PAGE_SZ and page1_hmac_ok(page1, bytes.fromhex(enc_key_hex))
 
 
 def decrypt_page(enc_key, page_data, pgno):
@@ -67,15 +150,9 @@ def decrypt_database(db_path, out_path, enc_key):
         print(f"  [ERROR] 文件太小")
         return False
 
-    # 提取salt并派生mac_key, 验证page 1
-    salt = page1[:SALT_SZ]
-    mac_key = derive_mac_key(enc_key, salt)
-    p1_hmac_data = page1[SALT_SZ : PAGE_SZ - RESERVE_SZ + IV_SZ]
-    p1_stored_hmac = page1[PAGE_SZ - HMAC_SZ : PAGE_SZ]
-    hm = hmac_mod.new(mac_key, p1_hmac_data, hashlib.sha512)
-    hm.update(struct.pack('<I', 1))
-    if hm.digest() != p1_stored_hmac:
-        print(f"  [ERROR] Page 1 HMAC验证失败! salt: {salt.hex()}")
+    # 验证page 1
+    if not page1_hmac_ok(page1, enc_key):
+        print(f"  [ERROR] Page 1 HMAC验证失败! salt: {page1[:SALT_SZ].hex()}")
         return False
 
     print(f"  HMAC OK, {total_pages} pages")
@@ -109,16 +186,7 @@ def main():
     print("  WeChat 4.0 数据库解密器")
     print("=" * 60)
 
-    # 加载密钥
-    if not os.path.exists(KEYS_FILE):
-        print(f"[ERROR] 密钥文件不存在: {KEYS_FILE}")
-        print("请先运行 find_all_keys.py")
-        sys.exit(1)
-
-    with open(KEYS_FILE) as f:
-        keys = json.load(f)
-
-    keys.pop("_db_dir", None)
+    keys = ensure_keys()
     print(f"\n加载 {len(keys)} 个数据库密钥")
     print(f"输出目录: {OUT_DIR}")
     os.makedirs(OUT_DIR, exist_ok=True)

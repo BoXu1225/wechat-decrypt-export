@@ -32,27 +32,20 @@ Message content may be zstd-compressed (WCDB_CT=4, no dictionary). The export st
 
 ## Quick start
 
-### 1. Extract encryption keys
+One command does everything; the first run handles all setup automatically:
 
 ```bash
-# Compile (one-time)
-cc -O2 -o find_all_keys_macos find_all_keys_macos.c -framework Foundation
-
-# Run (WeChat must be open, requires root)
-sudo ./find_all_keys_macos
+python export_chat.py ning
 ```
 
-Outputs `all_keys.json` mapping each database to its encryption key.
+It will:
+1. **Extract keys** — on first run, when a new database appears, or when a key goes stale, it compiles and runs `find_all_keys_macos` (asks for your sudo password; WeChat must be open)
+2. **Decrypt databases** — into `decrypted/`, only the ones that changed, validated with HMAC and a SQLite integrity check
+3. **Export the chat**
 
-### 2. Decrypt databases
+You can also run decryption on its own: `python decrypt_db.py`
 
-```bash
-python decrypt_db.py
-```
-
-Decrypts all databases to `decrypted/`. Validates each with HMAC and SQLite integrity check.
-
-### 3. Export a chat
+### Export options
 
 ```bash
 # Fuzzy search for a contact (partial match, interactive selection)
