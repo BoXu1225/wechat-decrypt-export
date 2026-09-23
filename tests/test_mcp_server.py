@@ -428,12 +428,22 @@ class FakeDecryptor(types.SimpleNamespace):
     def page1_hmac_ok(self, page1, key):
         return key == self.good_key
 
+    # Change tracking like decrypt_db's state file, kept in memory.
+    def load_state(self, out_dir):
+        return dict(self.__dict__.setdefault("state", {}))
+
+    def save_state(self, out_dir, updates):
+        self.state.update(updates)
+
+    def is_current(self, state, rel, src, out):
+        return os.path.exists(out) and state.get(rel) == os.stat(src).st_mtime_ns
+
     def decrypt_database(self, src, out, key):
         print("decrypting", src)             # must not reach real stdout
         self.calls.append(src)
         os.makedirs(os.path.dirname(out), exist_ok=True)
         shutil.copyfile(src, out)
-        return True
+        return os.stat(src).st_mtime_ns
 
 
 class RefreshTest(unittest.TestCase):

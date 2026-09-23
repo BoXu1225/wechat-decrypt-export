@@ -779,6 +779,7 @@ class WeChatData:
                 keys = json.load(f)
             keys.pop("_db_dir", None)
         dd = self._load_decryptor()
+        state = dd.load_state(self.decrypted_dir)
         updated, unchanged, missing, stale, failed = [], 0, [], [], []
         for root, _, files in os.walk(db_dir):
             for fn in files:
@@ -789,7 +790,7 @@ class WeChatData:
                 if not all_dbs and not _WANTED_DB_RE.match(rel):
                     continue
                 out = os.path.join(self.decrypted_dir, rel)
-                if os.path.exists(out) and os.path.getmtime(out) >= os.path.getmtime(src):
+                if dd.is_current(state, rel, src, out):  # neither .db nor -wal changed
                     unchanged += 1
                     continue
                 if rel not in keys:
@@ -804,9 +805,10 @@ class WeChatData:
                 tmp = out + ".mcp_tmp"
                 try:
                     with contextlib.redirect_stdout(sys.stderr):
-                        ok = dd.decrypt_database(src, tmp, key)
-                    if ok:
+                        sig = dd.decrypt_database(src, tmp, key)  # includes -wal
+                    if sig:
                         os.replace(tmp, out)
+                        dd.save_state(self.decrypted_dir, {rel: sig})
                         updated.append(rel)
                     else:
                         failed.append(rel)
