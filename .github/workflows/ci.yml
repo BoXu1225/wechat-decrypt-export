@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }} (macOS arm64)
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyflakes
+
+      - name: Python syntax check
+        run: python -m compileall -q .
+
+      - name: pyflakes
+        run: python -m pyflakes ./*.py tests/*.py
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+  build-lint:
+    name: Build C scanner / Swift helper, shellcheck
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile key scanner
+        run: cc -O2 -Wall -Wextra -Werror -o "$RUNNER_TEMP/find_all_keys_macos" find_all_keys_macos.c -framework Foundation
+
+      - name: Build Swift helper
+        if: hashFiles('helper/build.sh') != ''
+        run: bash helper/build.sh --force
+
+      - name: Install shellcheck
+        run: command -v shellcheck >/dev/null || brew install shellcheck
+
+      - name: shellcheck
+        run: |
+          shopt -s nullglob
+          shellcheck setup.sh wechat helper/*.sh
