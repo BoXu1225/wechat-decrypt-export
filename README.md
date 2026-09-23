@@ -64,6 +64,21 @@
 - **图片**：解码微信 4.x 加密的 `.dat` 图片（包括基于 HEVC 的 wxgf 格式，用 macOS 自带的 `sips` 转为 JPEG）。图片密钥从本地账号文件推导，不需要额外的 `sudo`。如果微信只有缩略图（原图从未下载），先使用缩略图，之后原图出现时再次导出会自动替换
 - **旧的增量格式**：如果之前用过 `export/<名称>/output_N.txt` 格式，第一次增量导出时会把这些文件合并到 `export/<名称>.txt`，之后可以删除旧文件夹
 
+## 朋友圈与收藏
+
+```bash
+./wechat moments                         # 本地缓存的全部朋友圈 -> export/moments.html
+./wechat moments 张三 --images            # 某人的朋友圈，附本地缓存的图片/视频
+./wechat moments 我 -f md --since 2025-01-01
+./wechat favorites                       # 全部收藏 -> export/favorites.html
+./wechat favorites 发票 --type file -f json
+```
+
+两者都支持 `-f html|md|json|txt`（默认 html）、`--since` / `--until`、`--images`、`-o`、`--export-dir`、`--no-decrypt`。`moments` 可按作者过滤（备注/昵称/微信号，部分匹配；`我` = 自己），`-q` 按内容搜索；`favorites` 可带搜索词、`--type` 和 `--tag`。输出为 `export/moments[_<名称>].<扩展名>` / `export/favorites.<扩展名>`，媒体文件在同名 `_files/` 目录。
+
+- **朋友圈**（`sns/sns.db`）只包含本机微信加载过的动态（自己的和刷到过的好友动态），含文字、链接、位置、点赞和评论（按通讯录显示名称）。图片/视频只有在微信本地缓存（`cache/<月份>/Sns/`）中时才能导出；CDN 链接保留在 JSON 中，不会联网下载。
+- **收藏**（`favorite/favorite.db`）：文字、链接、图片、文件、聊天记录、笔记、位置等，含来源聊天/发送者和标签。只有微信已保存在本地的文件能导出。
+
 ## 配置
 
 无需配置：首次运行时会自动检测微信数据目录并保存到 `config.json`（有多个账号时让你选择），你自己的微信 ID 从目录名自动推导。如需手动指定，编辑 `config.json`：
@@ -96,12 +111,13 @@ WCDB（微信的 SQLCipher 封装层）会在进程内存中缓存派生后的�
 | 文件 | 说明 |
 |------|------|
 | `setup.sh` | 一次性环境配置（venv、扫描器、微信签名） |
-| `wechat` | 启动脚本：`./wechat …` 导出，`./wechat decrypt` 解密 |
+| `wechat` | 启动脚本：`./wechat …` 导出，`./wechat decrypt` 解密，`./wechat moments` / `favorites` |
 | `find_all_keys_macos.c` | C 源码 — 通过 Mach VM API 扫描微信进程内存提取 SQLCipher 密钥 |
 | `decrypt_db.py` | 解密有变化的数据库；密钥缺失或过期时自动提取 |
 | `export_chat.py` | 命令行：搜索、列出、导出 |
 | `chats.py` | 聊天发现、联系人、群成员名称、消息解析 |
 | `formatters.py` | txt / md / html / json / csv 输出 |
+| `moments.py`、`favorites.py`、`social_common.py` | 朋友圈 / 收藏解析、媒体查找和导出 |
 | `image_decode.py` | 解码微信 `.dat` 图片，并把消息对应到图片文件 |
 | `config.py` | 配置加载与自动检测 |
 | `tests/` | 单元测试（使用合成数据）：`./venv/bin/python -m unittest discover -s tests` |

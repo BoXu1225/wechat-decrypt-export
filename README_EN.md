@@ -64,6 +64,21 @@ What the exporter handles:
 - **Images**: WeChat 4.x encrypted `.dat` images (including the HEVC-based wxgf format, converted to JPEG with macOS's built-in `sips`). The image key is derived from local account files — no extra `sudo` needed. When WeChat only has a thumbnail (full image never downloaded), the thumbnail is used and upgraded on a later export once the full image exists
 - **Old incremental layout**: if you used the previous `export/<name>/output_N.txt` layout, the first incremental export merges those files into `export/<name>.txt`; the old folder can then be deleted
 
+## Moments & Favorites
+
+```bash
+./wechat moments                         # all locally cached Moments posts -> export/moments.html
+./wechat moments 张三 --images            # one person's posts with cached photos/videos
+./wechat moments 我 -f md --since 2025-01-01
+./wechat favorites                       # all Favorites -> export/favorites.html
+./wechat favorites 发票 --type file -f json
+```
+
+Both take `-f html|md|json|txt` (default html), `--since` / `--until`, `--images`, `-o`, `--export-dir`, `--no-decrypt`. `moments` takes an optional author filter (remark / nickname / WeChat ID, partial; `我` = you) and `-q` text search; `favorites` takes an optional search query, `--type` and `--tag`. Output: `export/moments[_<name>].<ext>` / `export/favorites.<ext>`, media in a `_files/` folder next to it.
+
+- **Moments** (`sns/sns.db`) holds only posts WeChat has loaded on this Mac — your own and friends' posts you scrolled past — with text, links, location, likes and comments (names resolved through your contacts). Photos and videos are exported only when they are in WeChat's local cache (`cache/<month>/Sns/`); CDN URLs are kept in JSON but never downloaded.
+- **Favorites** (`favorite/favorite.db`): text, links, images, files, chat records, notes, locations, with source chat/sender and tags. Only files WeChat has saved locally can be exported.
+
 ## Configuration
 
 Nothing to configure: on first run the WeChat data folder is auto-detected and saved to `config.json` (you pick one if there are several accounts), and your own WeChat ID is derived from the folder name. To override, edit `config.json`:
@@ -96,12 +111,13 @@ Each chat's messages live in tables named `Msg_<md5(username)>`; message content
 | File | Purpose |
 |------|---------|
 | `setup.sh` | One-time environment setup (venv, scanner, WeChat signing) |
-| `wechat` | Launcher: `./wechat …` → export, `./wechat decrypt` → decrypt |
+| `wechat` | Launcher: `./wechat …` → export, `./wechat decrypt` → decrypt, `./wechat moments` / `favorites` |
 | `find_all_keys_macos.c` | C — scans WeChat process memory for SQLCipher keys (Mach VM API) |
 | `decrypt_db.py` | Decrypts changed databases; extracts keys automatically when missing or stale |
 | `export_chat.py` | Command line: search, list, export |
 | `chats.py` | Chat discovery, contacts, group sender names, message parsing |
 | `formatters.py` | txt / md / html / json / csv writers |
+| `moments.py`, `favorites.py`, `social_common.py` | Moments / Favorites parsing, media lookup and export |
 | `image_decode.py` | Decodes WeChat `.dat` images and maps messages to image files |
 | `config.py` | Config loader and auto-detection |
 | `tests/` | Unit tests (synthetic data): `./venv/bin/python -m unittest discover -s tests` |
