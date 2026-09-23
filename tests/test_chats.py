@@ -217,6 +217,97 @@ class ChatsTest(unittest.TestCase):
         self.assertEqual(chats.parse_chat_room_members(b"\xff\xff"), {})
         self.assertEqual(chats.parse_chat_room_members(None), {})
 
+    def test_load_contact_rows(self):
+        rows = chats.load_contact_rows(self.dir)
+        self.assertEqual(rows[ALICE], {"username": ALICE, "remark": "Alice R",
+                                       "nick_name": "alice nick", "alias": "", "local_type": 1,
+                                       "display": "Alice R", "source": "contact"})
+        self.assertEqual(rows[CAROL]["display"], CAROL)
+        self.assertEqual((rows[DAVE]["source"], rows[DAVE]["local_type"]), ("stranger", 3))
+        self.assertEqual(rows[ROOM]["local_type"], 2)
+        self.assertEqual(chats.load_contact_rows(os.path.join(self.tmp, "nope")), {})
+
+    def test_load_contact_rows_contact_overrides_stranger_and_old_schema(self):
+        d = tempfile.mkdtemp(dir=self.tmp)
+        os.makedirs(os.path.join(d, "contact"))
+        conn = sqlite3.connect(os.path.join(d, "contact", "contact.db"))
+        # No alias / local_type columns (older schema).
+        for t in ("contact", "stranger"):
+            conn.execute(f"CREATE TABLE {t}(username TEXT, remark TEXT, nick_name TEXT)")
+        conn.execute("INSERT INTO stranger VALUES ('u1', '', 'as stranger')")
+        conn.execute("INSERT INTO contact VALUES ('u1', ' R ', 'as contact')")
+        conn.execute("INSERT INTO contact VALUES ('', 'x', 'x')")
+        conn.commit()
+        conn.close()
+        rows = chats.load_contact_rows(d)
+        self.assertEqual(list(rows), ["u1"])
+        self.assertEqual(rows["u1"], {"username": "u1", "remark": "R", "nick_name": "as contact",
+                                      "alias": "", "local_type": 0, "display": "R",
+                                      "source": "contact"})
+
+    def test_load_room_members(self):
+        rooms = chats.load_room_members(self.dir)
+        self.assertEqual(rooms, {ROOM: {SELF: "", BOB: "Bob in group", DAVE: "", CAROL: ""}})
+        self.assertEqual(list(rooms[ROOM]), [SELF, BOB, DAVE, CAROL])  # ext_buffer order
+        self.assertEqual(chats.load_room_members(os.path.join(self.tmp, "nope")), {})
+        self.assertEqual(chats.group_nicknames_from_members(
+            {"a": {"x": "", "y": "Y"}, "b": {"z": ""}}), {"a": {"y": "Y"}})
+
+    def test_table_exists_and_pick_name(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE t(x)")
+        self.assertTrue(chats.table_exists(conn, "t"))
+        self.assertFalse(chats.table_exists(conn, "u"))
+        conn.close()
+        self.assertEqual(chats.pick_name("u", " R ", "N"), "R")
+        self.assertEqual(chats.pick_name("u", "  ", " N "), "N")
+        self.assertEqual(chats.pick_name("u", None, None), "u")
+
+    def test_unnamed_group_name(self):
+        names = {"a": "A", "b": "B", "c": "C", "d": "D"}
+        f = chats.unnamed_group_name
+        self.assertEqual(f(["me", "a", "b"], names, "me"), "A、B")
+        self.assertEqual(f(["a", "b", "c"], names, "me"), "A、B、C")
+        self.assertEqual(f(["me", "a", "b", "c", "d"], names, "me"), "A、B、C等5人")
+        self.assertEqual(f(["a", "x"], names), "A、x")          # username fallback
+        self.assertIsNone(f(["me"], names, "me"))
+        self.assertIsNone(f([], names))
+
+    def test_name_unnamed_groups(self):
+        lst = [{"username": "r1@chatroom", "name": "r1@chatroom", "is_group": True},
+               {"username": "r2@chatroom", "name": "Named", "is_group": True},
+               {"username": "r3@chatroom", "name": "r3@chatroom", "is_group": True},
+               {"username": "u", "name": "u", "is_group": False}]
+        rooms = {"r1@chatroom": {"me": "", "a": "nick"}, "r2@chatroom": {"a": ""},
+                 "u": {"a": ""}}
+        out = chats.name_unnamed_groups(lst, rooms, {"a": "A"}, "me")
+        self.assertIs(out, lst)
+        self.assertEqual([c["name"] for c in lst], ["A", "Named", "r3@chatroom", "u"])
+
+    def test_db_number(self):
+        self.assertEqual(chats.db_number("/x/message/message_12.db"), 12)
+        self.assertIsNone(chats.db_number("/x/message/message_resource.db"))
+
+    def test_iso_and_parse_time(self):
+        import datetime as dt
+        self.assertIsNone(chats.iso(0))
+        self.assertIsNone(chats.iso(None))
+        self.assertEqual(chats.iso(1700000000),
+                         dt.datetime.fromtimestamp(1700000000).isoformat(timespec="seconds"))
+        p = chats.parse_time
+        day = int(dt.datetime(2024, 3, 5).timestamp())
+        self.assertIsNone(p(None))
+        self.assertEqual(p(12.7), 12)
+        self.assertEqual(p(" 1700000000 "), 1700000000)
+        self.assertEqual(p("2024/03/05", end=True), day + 86399)
+        self.assertEqual(p("2024-03-05 10:30:15"), day + 10 * 3600 + 1815)
+        self.assertEqual(p("2w", now=2_000_000), 2_000_000 - 14 * 86400)
+        self.assertEqual(p("30m", now=2_000_000), 2_000_000 - 1800)
+        self.assertEqual(p("2024-03-05T00:00:00+00:00"),
+                         int(dt.datetime(2024, 3, 5, tzinfo=dt.timezone.utc).timestamp()))
+        with self.assertRaisesRegex(ValueError, "cannot parse time"):
+            p("last tuesday")
+
     # -- list_chats ---------------------------------------------------------
     def test_md5_table_name(self):
         self.assertEqual(chats.table_name_for(ALICE),

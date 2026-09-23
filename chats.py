@@ -23,10 +23,12 @@ Storage facts relied on (WeChat 4.x, macOS):
     repeated field 1 = member {1: username, 2: group nickname, 4: inviter}.
   - message_content is zstd-compressed when WCDB_CT_message_content == 4.
 """
+import datetime as _dt
 import hashlib
 import os
 import re
 import sqlite3
+import time
 
 import zstandard
 
@@ -166,13 +168,15 @@ def _contact_db(decrypted_dir):
     return os.path.join(decrypted_dir, "contact", "contact.db")
 
 
-def _table_exists(conn, name):
+def table_exists(conn, name):
+    """True if the SQLite connection has a table called name."""
     return conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
     ).fetchone() is not None
 
 
-def _pick_name(username, remark, nick):
+def pick_name(username, remark, nick):
+    """Display name: stripped remark > stripped nickname > username."""
     for v in (remark, nick):
         if v and v.strip():
             return v.strip()
@@ -189,12 +193,47 @@ def load_contacts(decrypted_dir):
     try:
         # "stranger" first so real contacts override it.
         for table in ("stranger", "contact"):
-            if not _table_exists(conn, table):
+            if not table_exists(conn, table):
                 continue
             for username, remark, nick in conn.execute(
                     f"SELECT username, remark, nick_name FROM [{table}]"):
                 if username:
-                    out[username] = _pick_name(username, remark, nick)
+                    out[username] = pick_name(username, remark, nick)
+    finally:
+        conn.close()
+    return out
+
+
+def load_contact_rows(decrypted_dir):
+    """{username: {username, remark, nick_name, alias, local_type, display, source}}.
+
+    Like load_contacts but keeps the individual fields; source is the table
+    ("stranger" or "contact"), contact rows override stranger rows."""
+    path = _contact_db(decrypted_dir)
+    if not os.path.exists(path):
+        return {}
+    out = {}
+    conn = sqlite3.connect(path)
+    try:
+        for table in ("stranger", "contact"):
+            if not table_exists(conn, table):
+                continue
+            cols = {r[1] for r in conn.execute(f"PRAGMA table_info([{table}])")}
+            alias = "alias" if "alias" in cols else "''"
+            ltype = "local_type" if "local_type" in cols else "0"
+            for u, remark, nick, al, lt in conn.execute(
+                    f"SELECT username, remark, nick_name, {alias}, {ltype} FROM [{table}]"):
+                if not u:
+                    continue
+                out[u] = {
+                    "username": u,
+                    "remark": (remark or "").strip(),
+                    "nick_name": (nick or "").strip(),
+                    "alias": (al or "").strip(),
+                    "local_type": lt or 0,
+                    "display": pick_name(u, remark, nick),
+                    "source": table,
+                }
     finally:
         conn.close()
     return out
@@ -207,7 +246,7 @@ def _load_contact_flags(decrypted_dir):
         return {}
     conn = sqlite3.connect(path)
     try:
-        if not _table_exists(conn, "contact"):
+        if not table_exists(conn, "contact"):
             return {}
         return {u: (vf or 0) for u, vf in conn.execute(
             "SELECT username, verify_flag FROM contact")}
@@ -275,23 +314,37 @@ def parse_chat_room_members(ext_buffer):
     return members
 
 
-def load_group_nicknames(decrypted_dir):
-    """Return {room_username: {member_username: group_nickname}} (non-empty only)."""
+def load_room_members(decrypted_dir):
+    """Return {room_username: {member_username: group_nickname or ''}} for every
+    room, including members without a group nickname (in ext_buffer order)."""
     path = _contact_db(decrypted_dir)
     if not os.path.exists(path):
         return {}
     conn = sqlite3.connect(path)
     try:
-        if not _table_exists(conn, "chat_room"):
+        if not table_exists(conn, "chat_room"):
             return {}
-        out = {}
-        for room, buf in conn.execute("SELECT username, ext_buffer FROM chat_room"):
-            nicks = {u: n for u, n in parse_chat_room_members(buf).items() if n}
-            if room and nicks:
-                out[room] = nicks
-        return out
+        return {room: parse_chat_room_members(buf)
+                for room, buf in conn.execute("SELECT username, ext_buffer FROM chat_room")
+                if room}
     finally:
         conn.close()
+
+
+def group_nicknames_from_members(room_members):
+    """load_room_members output -> {room: {member: group_nickname}}, keeping
+    only non-empty nicknames and rooms that have at least one."""
+    out = {}
+    for room, members in room_members.items():
+        nicks = {u: n for u, n in members.items() if n}
+        if nicks:
+            out[room] = nicks
+    return out
+
+
+def load_group_nicknames(decrypted_dir):
+    """Return {room_username: {member_username: group_nickname}} (non-empty only)."""
+    return group_nicknames_from_members(load_room_members(decrypted_dir))
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +437,29 @@ def list_chats(decrypted_dir, include_system=False, contacts=None):
     return sorted(chats.values(), key=lambda c: (-c["last_ts"], c["username"]))
 
 
+def unnamed_group_name(members, contacts, self_wxid=None):
+    """Name for a group without a name, like WeChat does: the first three
+    members other than self ("A、B、C"), plus "等N人" (N = members + self) when
+    there are more than three. members: iterable of usernames in room order.
+    Returns None when there is nobody to name it after."""
+    others = [u for u in members if u != self_wxid]
+    if not others:
+        return None
+    names = [contacts.get(u, u) for u in others[:3]]
+    return "、".join(names) + (f"等{len(others) + 1}人" if len(others) > 3 else "")
+
+
+def name_unnamed_groups(chat_list, room_members, contacts, self_wxid=None):
+    """Give list_chats entries of unnamed groups (name == username) a
+    member-based name (see unnamed_group_name), in place. Returns chat_list."""
+    for c in chat_list:
+        if c["is_group"] and c["name"] == c["username"]:
+            name = unnamed_group_name(room_members.get(c["username"], {}), contacts, self_wxid)
+            if name:
+                c["name"] = name
+    return chat_list
+
+
 def find_chats(pattern, chats):
     """Case-insensitive substring match on name or username.
 
@@ -401,6 +477,61 @@ def find_chats(pattern, chats):
         elif pat in name.lower() or pat in c["username"].lower():
             rest.append(c)
     return exact + exact_ci + rest
+
+
+_MSG_DB_RE = re.compile(r"message_(\d+)\.db$")
+
+
+def db_number(db_path):
+    """message_N.db path -> N (None for other paths)."""
+    m = _MSG_DB_RE.search(db_path)
+    return int(m.group(1)) if m else None
+
+
+# ---------------------------------------------------------------------------
+# Time
+# ---------------------------------------------------------------------------
+
+def iso(ts):
+    """Unix seconds -> local ISO 8601 string (seconds precision); falsy -> None."""
+    if not ts:
+        return None
+    return _dt.datetime.fromtimestamp(ts).isoformat(timespec="seconds")
+
+
+_REL_RE = re.compile(r"^\s*(\d+)\s*([mhdw])\s*$")
+
+
+def parse_time(value, end=False, now=None):
+    """Parse a time into unix seconds. None/'' -> None.
+
+    Accepts int/float, unix seconds as a string, "YYYY-MM-DD" (or with "/"),
+    "YYYY-MM-DD HH:MM[:SS]" / ISO 8601 (local time unless it has an offset),
+    and relative "30m" / "12h" / "7d" / "2w" meaning that long before now.
+    end=True makes a date-only value inclusive (end of that day).
+    Raises ValueError for anything else."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    s = str(value).strip()
+    if re.fullmatch(r"\d{9,11}", s):
+        return int(s)
+    m = _REL_RE.match(s)
+    if m:
+        mult = {"m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}[m.group(2)]
+        return int((now or time.time()) - int(m.group(1)) * mult)
+    try:
+        d = _dt.datetime.fromisoformat(s.replace("/", "-"))
+    except ValueError:
+        raise ValueError(f"cannot parse time {value!r}; use YYYY-MM-DD, "
+                         "YYYY-MM-DD HH:MM, unix seconds, or 7d/12h/30m") from None
+    date_only = re.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}", s.replace("/", "-")) is not None
+    if d.tzinfo is not None:
+        d = d.astimezone().replace(tzinfo=None)
+    if end and date_only:
+        d = d + _dt.timedelta(days=1) - _dt.timedelta(seconds=1)
+    return int(d.timestamp())
 
 
 # ---------------------------------------------------------------------------
