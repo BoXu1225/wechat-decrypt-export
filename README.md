@@ -53,9 +53,10 @@
 | `--all` | 增量导出所有聊天 |
 | `--list [过滤词]` | 列出聊天 |
 | `--type` | `all`（默认）、`single`（单聊）、`group`（群聊） |
-| `--images` | 解码图片到 `export/<名称>_files/`，在 md/html/json 中直接显示（txt/csv 仍显示 `[图片]`） |
+| `--images` | 解码图片到 `export/<名称>_files/`，在 md/html/json 中直接显示（txt/csv 仍显示 `[图片]`）；已缓存的表情也会一起显示 |
 | `--voice` | 把语音转换为 `export/<名称>_files/<id>.m4a`，html 中可直接播放（`<audio>`），md/json 中为链接；txt/csv 显示 `[语音 12″]` |
 | `--media` | `--images` + `--voice` + 复制已下载的视频（`<md5>.mp4`，封面 `<md5>_thumb.jpg`），html 中用 `<video>` 播放；txt/csv 显示 `[视频 0:35]` |
+| `--download-emoji` | 配合 `--images` / `--media`：本地没有的表情从消息里的微信 CDN 地址下载（默认关闭，缓存到 `decrypted/emoji_cache/`） |
 | `--since` / `--until` | 日期范围 `YYYY-MM-DD`，包含当天 |
 | `-o`, `--output` | 输出文件（默认 `export/<名称>_chat.<扩展名>`） |
 | `--export-dir` | 导出目录（默认 `export/`） |
@@ -66,8 +67,9 @@
 - **群聊**：每条消息显示发送者的群昵称，没有则显示你的备注或对方昵称
 - **跨数据库的聊天**（`message_0.db`、`message_1.db`……大约每年一个）
 - **消息类型**：文字、图片、语音、视频、表情、链接、文件、引用、小程序、系统消息；自动解压 zstd 压缩的消息
-- **图片**：解码微信 4.x 加密的 `.dat` 图片（包括基于 HEVC 的 wxgf 格式，用 macOS 自带的 `sips` 转为 JPEG）。图片密钥从本地账号文件推导，不需要额外的 `sudo`。如果微信只有缩略图（原图从未下载），先使用缩略图，之后原图出现时再次导出会自动替换
+- **图片**：解码微信 4.x 加密的 `.dat` 图片（包括基于 HEVC 的 wxgf 格式，用 macOS 自带的 `sips` 转为 JPEG；带透明通道的 wxgf 转为透明 PNG）。图片密钥从本地账号文件推导，不需要额外的 `sudo`。如果微信只有缩略图（原图从未下载），先使用缩略图，之后原图出现时再次导出会自动替换
 - **语音 / 视频**：语音（存放在 `message/media_0.db` 中的 SILK v3 数据）用 `silk-python` 解码，再用 macOS 自带的 `afconvert` 编码为 AAC `.m4a`（没有 afconvert 时保存为 WAV）。微信已下载的视频是普通 MP4，直接复制（同一磁盘卷上为 APFS 克隆，不额外占空间）；未下载的视频显示封面。时长取自消息本身。已导出的文件会复用，增量导出只转换新消息。音视频使用 `preload="none"`，大型 HTML 也能快速打开
+- **表情**：微信本地的表情缓存是加密的（密钥未知），所以表情图片需要用 `--download-emoji` 从消息中的 CDN 地址下载一次（只访问微信 CDN 域名，有超时和大小限制；失败的一周内不再重试）。`./venv/bin/python emoticon.py` 可统计有多少表情可下载（只输出数量）
 - **旧的增量格式**：如果之前用过 `export/<名称>/output_N.txt` 格式，第一次增量导出时会把这些文件合并到 `export/<名称>.txt`，之后可以删除旧文件夹
 
 ## 自动备份

@@ -53,9 +53,10 @@ Decrypt on its own with `./wechat decrypt`.
 | `--all` | Incremental export of every chat |
 | `--list [filter]` | List chats |
 | `--type` | `all` (default), `single` (1-on-1), `group` |
-| `--images` | Decode images into `export/<name>_files/` and embed them in md/html/json (txt/csv show `[图片]`) |
+| `--images` | Decode images into `export/<name>_files/` and embed them in md/html/json (txt/csv show `[图片]`); cached stickers are shown too |
 | `--voice` | Convert voice messages to `export/<name>_files/<id>.m4a`, playable in html (`<audio>`) and linked from md/json; txt/csv show `[语音 12″]` |
 | `--media` | `--images` + `--voice` + copy downloaded videos (`<md5>.mp4`, thumbnail `<md5>_thumb.jpg`) for html `<video>` / md / json; txt/csv show `[视频 0:35]` |
+| `--download-emoji` | With `--images` / `--media`: download stickers that are not available locally from the WeChat CDN URL in the message (off by default; cached in `decrypted/emoji_cache/`) |
 | `--since` / `--until` | Date range, `YYYY-MM-DD`, inclusive |
 | `-o`, `--output` | Output file (default `export/<name>_chat.<ext>`) |
 | `--export-dir` | Export folder (default `export/`) |
@@ -66,8 +67,9 @@ What the exporter handles:
 - **Group chats**: each message shows the sender's group nickname, else your remark/their nickname
 - **Chats spanning several databases** (`message_0.db`, `message_1.db`, … — roughly one per year)
 - **Message types**: text, images, voice, video, stickers, links, files, quotes, mini programs, system messages; zstd-compressed messages are decompressed
-- **Images**: WeChat 4.x encrypted `.dat` images (including the HEVC-based wxgf format, converted to JPEG with macOS's built-in `sips`). The image key is derived from local account files — no extra `sudo` needed. When WeChat only has a thumbnail (full image never downloaded), the thumbnail is used and upgraded on a later export once the full image exists
+- **Images**: WeChat 4.x encrypted `.dat` images (including the HEVC-based wxgf format, converted to JPEG with macOS's built-in `sips`; wxgf images with an alpha channel become transparent PNGs). The image key is derived from local account files — no extra `sudo` needed. When WeChat only has a thumbnail (full image never downloaded), the thumbnail is used and upgraded on a later export once the full image exists
 - **Voice / video**: voice messages (SILK v3 stored in `message/media_0.db`) are decoded with the `silk-python` package and encoded to AAC `.m4a` with macOS's built-in `afconvert` (WAV if unavailable). Videos WeChat has downloaded are plain MP4s and are copied (an APFS clone on the same volume, so no extra space); videos never downloaded show their thumbnail. Durations come from the message. Already exported files are reused, so incremental exports only convert new messages. Audio/video use `preload="none"` so large HTML pages open quickly
+- **Stickers**: WeChat's local sticker cache is encrypted (unknown key), so sticker images are fetched once with `--download-emoji` from the CDN URL in the message (WeChat CDN hosts only, with timeout and size limits; failures are not retried for a week). `./venv/bin/python emoticon.py` reports how many stickers are downloadable (counts only)
 - **Old incremental layout**: if you used the previous `export/<name>/output_N.txt` layout, the first incremental export merges those files into `export/<name>.txt`; the old folder can then be deleted
 
 ## Automatic backup

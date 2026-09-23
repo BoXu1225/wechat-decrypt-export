@@ -505,6 +505,7 @@ def iter_messages(chat, decrypted_dir, self_wxid, contacts, group_nicknames=None
     and video records; it holds the file md5 (see image_decode / media_decode).
     It also adds "media_duration" (seconds, float) to voice records (XML
     voicelength) and video records (XML playlength) when the XML has it.
+    Sticker records (kind "emoji") get "emoji_xml" (the raw <emoji .../> content).
     Messages whose formatted text is None are dropped.
     decrypted_dir is accepted for API symmetry (and group nicknames);
     table locations come from chat["tables"].
@@ -605,6 +606,8 @@ def iter_messages(chat, decrypted_dir, self_wxid, contacts, group_nicknames=None
                     dur = media_duration(text, kind)
                     if dur is not None:
                         rec["media_duration"] = dur
+                if kind == "emoji":
+                    rec["emoji_xml"] = text  # <emoji md5= cdnurl= ...>, see emoticon.py
             records.append((create_time or 0, sort_seq or 0, rec))
 
     # Stable sort keeps DB order (oldest DB first) for equal keys.

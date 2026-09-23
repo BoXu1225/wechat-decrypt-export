@@ -21,8 +21,10 @@ V1/V2 layout:
 
 Decrypted payloads are JPEG / PNG / GIF / WEBP / BMP, or "wxgf" (Tencent's
 HEVC-in-a-wrapper format).  wxgf is converted to a real image by wrapping the
-HEVC bitstream into a minimal HEIC container (pure Python) and, by default,
-converting that to JPEG with macOS' built-in `sips`.
+HEVC bitstream into a minimal HEIC container (pure Python) and converting that
+with macOS' built-in `sips`: JPEG by default, PNG with transparency when the
+wxgf carries a (non-opaque) second, monochrome HEVC stream - the alpha plane,
+stored in the HEIC as an auxiliary alpha image (see wxgf_streams()).
 
 Keys (per account, no memory scanning required on macOS):
     uin      = the number in  ~/Library/Containers/com.tencent.xinWeChat/Data/
@@ -188,7 +190,7 @@ def decrypt_dat(data, aes_key=None, xor_key=None):
     return payload, fmt
 
 
-def decode_dat(path, aes_key=None, xor_key=None, wxgf_to="jpg"):
+def decode_dat(path, aes_key=None, xor_key=None, wxgf_to="auto"):
     """Decode a WeChat .dat image file.
 
     Args:
@@ -196,8 +198,10 @@ def decode_dat(path, aes_key=None, xor_key=None, wxgf_to="jpg"):
         aes_key: 16-char str/bytes AES key (required for V2 files).
         xor_key: int 0-255 (required for V1/V2 files with an XOR tail;
                  inferred automatically for legacy XOR files).
-        wxgf_to: what to do with wxgf (HEVC) payloads:
-                 "jpg" (default, via macOS sips) | "png" | "heic" | None (raw wxgf).
+        wxgf_to: what to do with wxgf (HEVC) payloads (converted via macOS sips):
+                 "auto" (default) - PNG with transparency when the file has a
+                                    non-opaque alpha stream, JPEG otherwise
+                 "jpg" | "png" | "heic" (png/heic keep alpha) | None (raw wxgf).
     Returns:
         (image_bytes, ext) where ext is e.g. "jpg", "png", "gif", "heic", "wxgf".
     Raises:
@@ -206,13 +210,40 @@ def decode_dat(path, aes_key=None, xor_key=None, wxgf_to="jpg"):
     with open(path, "rb") as f:
         data = f.read()
     payload, _ = decrypt_dat(data, aes_key, xor_key)
+    return convert_payload(payload, wxgf_to)
+
+
+def convert_payload(payload, wxgf_to="auto"):
+    """Turn a decrypted image payload into (bytes, ext); wxgf is converted
+    according to wxgf_to (see decode_dat)."""
     ext = detect_ext(payload)
-    if ext == "wxgf" and wxgf_to:
-        heic = wxgf_to_heic(payload)
-        if wxgf_to == "heic":
-            return heic, "heic"
+    if ext != "wxgf" or not wxgf_to:
+        return payload, ext
+    return wxgf_convert(payload, wxgf_to)
+
+
+def wxgf_convert(payload, wxgf_to="auto"):
+    """Convert a wxgf payload to (bytes, ext); see decode_dat for wxgf_to."""
+    color, alpha = wxgf_streams(payload)
+    if wxgf_to == "auto":
+        if alpha is not None:
+            try:
+                if not alpha_is_opaque(alpha):
+                    return heic_convert(hevc_to_heic(color, alpha), "png"), "png"
+            except ImageDecodeError:
+                pass
+        return heic_convert(hevc_to_heic(color), "jpg"), "jpg"
+    if wxgf_to == "jpg":
+        return heic_convert(hevc_to_heic(color), "jpg"), "jpg"
+    heic = hevc_to_heic(color, alpha)
+    if wxgf_to == "heic":
+        return heic, "heic"
+    try:
         return heic_convert(heic, wxgf_to), wxgf_to
-    return payload, ext
+    except ImageDecodeError:
+        if alpha is None:
+            raise
+        return heic_convert(hevc_to_heic(color), wxgf_to), wxgf_to  # drop alpha
 
 
 # --------------------------------------------------------------------------
@@ -326,8 +357,9 @@ def _fullbox(typ, version, flags, payload):
     return _box(typ, struct.pack(">I", (version << 24) | flags) + payload)
 
 
-def hevc_to_heic(stream):
-    """Wrap a single-picture HEVC Annex-B stream into a minimal HEIC file."""
+def _hevc_item(stream):
+    """Parse a single-picture HEVC Annex-B stream -> (hvcC payload, sps info,
+    mdat payload of length-prefixed VCL NALs)."""
     nals = _split_annexb(stream)
     ps = {32: [], 33: [], 34: []}
     vcl = []
@@ -351,22 +383,56 @@ def hevc_to_heic(stream):
         hvcc += bytes([0x80 | t]) + struct.pack(">H", len(ps[t]))
         for n in ps[t]:
             hvcc += struct.pack(">H", len(n)) + n
-    mdat_payload = b"".join(struct.pack(">I", len(n)) + n for n in vcl)
+    data = b"".join(struct.pack(">I", len(n)) + n for n in vcl)
+    return hvcc, sps, data
+
+
+# auxiliary image type for an HEVC alpha plane (ISO/IEC 23008-12, HEIF)
+HEVC_ALPHA_URN = b"urn:mpeg:hevc:2015:auxid:1"
+
+
+def hevc_to_heic(stream, alpha=None):
+    """Wrap a single-picture HEVC Annex-B stream into a minimal HEIC file.
+
+    alpha: optional second HEVC stream (monochrome, same size) stored as an
+    auxiliary alpha image (auxC urn:mpeg:hevc:2015:auxid:1 + iref/auxl), which
+    macOS ImageIO/sips composites as transparency."""
+    hvcc, sps, color = _hevc_item(stream)
+    items = [(hvcc, sps, color)]
+    if alpha is not None:
+        items.append(_hevc_item(alpha))
 
     ftyp = _box(b"ftyp", b"heic" + struct.pack(">I", 0) + b"mif1heic")
     hdlr = _fullbox(b"hdlr", 0, 0, b"\0" * 4 + b"pict" + b"\0" * 12 + b"\0")
     pitm = _fullbox(b"pitm", 0, 0, struct.pack(">H", 1))
-    infe = _fullbox(b"infe", 2, 0, struct.pack(">HH", 1, 0) + b"hvc1" + b"\0")
-    iinf = _fullbox(b"iinf", 0, 0, struct.pack(">H", 1) + infe)
-    ispe = _fullbox(b"ispe", 0, 0, struct.pack(">II", sps["width"], sps["height"]))
-    ipco = _box(b"ipco", _box(b"hvcC", hvcc) + ispe)
-    ipma = _fullbox(b"ipma", 0, 0, struct.pack(">IHB", 1, 1, 2) + bytes([0x81, 0x02]))
-    iprp = _box(b"iprp", ipco + ipma)
+    infes = b"".join(_fullbox(b"infe", 2, 0, struct.pack(">HH", i + 1, 0) + b"hvc1" + b"\0")
+                     for i in range(len(items)))
+    iinf = _fullbox(b"iinf", 0, 0, struct.pack(">H", len(items)) + infes)
+    # properties: 1 hvcC(color) 2 ispe(color) [3 hvcC(alpha) 4 ispe(alpha) 5 auxC]
+    props = _box(b"hvcC", hvcc) + _fullbox(b"ispe", 0, 0, struct.pack(
+        ">II", sps["width"], sps["height"]))
+    assoc = [(1, [0x81, 0x02])]
+    iref = b""
+    if alpha is not None:
+        a_hvcc, a_sps, _ = items[1]
+        props += _box(b"hvcC", a_hvcc)
+        props += _fullbox(b"ispe", 0, 0, struct.pack(">II", a_sps["width"], a_sps["height"]))
+        props += _fullbox(b"auxC", 0, 0, HEVC_ALPHA_URN + b"\0")
+        assoc.append((2, [0x83, 0x04, 0x85]))
+        iref = _fullbox(b"iref", 0, 0, _box(b"auxl", struct.pack(">HHH", 2, 1, 1)))
+    ipma = _fullbox(b"ipma", 0, 0, struct.pack(">I", len(assoc)) + b"".join(
+        struct.pack(">HB", item_id, len(a)) + bytes(a) for item_id, a in assoc))
+    iprp = _box(b"iprp", _box(b"ipco", props) + ipma)
+    mdat_payload = b"".join(it[2] for it in items)
 
     def build(offset):
-        iloc = _fullbox(b"iloc", 0, 0, bytes([0x44, 0x00]) + struct.pack(
-            ">HHHHII", 1, 1, 0, 1, offset, len(mdat_payload)))
-        meta = _fullbox(b"meta", 0, 0, hdlr + pitm + iloc + iinf + iprp)
+        locs = b""
+        for i, it in enumerate(items):
+            locs += struct.pack(">HHHII", i + 1, 0, 1, offset, len(it[2]))
+            offset += len(it[2])
+        iloc = _fullbox(b"iloc", 0, 0, bytes([0x44, 0x00]) +
+                        struct.pack(">H", len(items)) + locs)
+        meta = _fullbox(b"meta", 0, 0, hdlr + pitm + iloc + iinf + iref + iprp)
         return ftyp + meta
 
     head = build(0)
@@ -374,22 +440,59 @@ def hevc_to_heic(stream):
     return head + _box(b"mdat", mdat_payload)
 
 
-def wxgf_to_heic(data):
-    """Convert wxgf payload to HEIC bytes (largest HEVC partition = colour image;
-    a small extra partition, when present, is not used)."""
+def _hevc_is_monochrome(stream):
+    for n in _split_annexb(stream):
+        if (n[0] >> 1) & 0x3F == 33:
+            return _parse_sps(n)["chroma"] == 0
+    return False
+
+
+def wxgf_streams(data):
+    """Split a wxgf payload into (color_stream, alpha_stream_or_None).
+
+    Layout (as observed in WeChat 4.x):
+        "wxgf" + header (byte 4 = header version/flags: 0x13 single stream,
+        0x12 with alpha), then one or two partitions, each preceded by a
+        4-byte big-endian length and starting with an HEVC VPS:
+          single:  [len][colour 4:2:0 stream]
+          alpha:   [len][alpha 4:0:0 (monochrome) stream][len][colour stream]
+    The colour stream is the largest non-monochrome partition; the alpha
+    stream is a monochrome partition with the same dimensions."""
     parts = _wxgf_partitions(data)
-    return hevc_to_heic(max(parts, key=len))
+    color = max(parts, key=len)
+    if len(parts) < 2:
+        return color, None
+    mono = [p for p in parts if p is not color and _hevc_is_monochrome(p)]
+    if not mono or _hevc_is_monochrome(color):
+        return color, None
+    try:
+        c_sps = _parse_sps(next(n for n in _split_annexb(color) if (n[0] >> 1) & 0x3F == 33))
+        a_sps = _parse_sps(next(n for n in _split_annexb(mono[0]) if (n[0] >> 1) & 0x3F == 33))
+    except (StopIteration, ImageDecodeError, IndexError):
+        return color, None
+    if (c_sps["width"], c_sps["height"]) != (a_sps["width"], a_sps["height"]):
+        return color, None
+    return color, mono[0]
 
 
-def heic_convert(heic, fmt="jpg"):
-    """Convert HEIC bytes to jpg/png with macOS sips."""
+def wxgf_to_heic(data, alpha=True):
+    """Convert wxgf payload to HEIC bytes. When the file carries an alpha
+    stream (and alpha=True) it becomes an auxiliary alpha image."""
+    color, a = wxgf_streams(data)
+    return hevc_to_heic(color, a if alpha else None)
+
+
+def wxgf_has_alpha(data):
+    return wxgf_streams(data)[1] is not None
+
+
+def _sips_convert(heic, sips_fmt, ext):
     sips = shutil.which("sips")
     if not sips:
         raise ImageDecodeError("sips not found; use wxgf_to='heic'")
-    sips_fmt = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png"}[fmt]
     with tempfile.TemporaryDirectory() as td:
         src = os.path.join(td, "in.heic")
-        dst = os.path.join(td, "out." + fmt)
+        dst = os.path.join(td, "out." + ext)
         with open(src, "wb") as f:
             f.write(heic)
         r = subprocess.run([sips, "-s", "format", sips_fmt, src, "--out", dst],
@@ -398,6 +501,49 @@ def heic_convert(heic, fmt="jpg"):
             raise ImageDecodeError("sips failed to convert HEIC: %s" % r.stderr.decode(errors="replace")[:200])
         with open(dst, "rb") as f:
             return f.read()
+
+
+def heic_convert(heic, fmt="jpg"):
+    """Convert HEIC bytes to jpg/png with macOS sips (png keeps an auxiliary
+    alpha image as transparency)."""
+    sips_fmt = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png"}[fmt]
+    return _sips_convert(heic, sips_fmt, fmt)
+
+
+def bmp_min_sample(bmp):
+    """Smallest 8-bit sample value in an uncompressed 24/32-bit BMP's pixel
+    rows (row padding excluded)."""
+    if bmp[:2] != b"BM" or len(bmp) < 54:
+        raise ImageDecodeError("not a BMP")
+    off = struct.unpack("<I", bmp[10:14])[0]
+    w, h, _, bpp, comp = struct.unpack("<iiHHI", bmp[18:34])
+    if comp not in (0, 3) or bpp not in (24, 32):
+        raise ImageDecodeError("unsupported BMP (bpp=%d, compression=%d)" % (bpp, comp))
+    row = w * bpp // 8
+    stride = (row + 3) & ~3
+    lo = 255
+    for y in range(abs(h)):
+        start = off + y * stride
+        line = bmp[start:start + row]
+        if bpp == 32:
+            line = bytes(b for i, b in enumerate(line) if i % 4 != 3)
+        if line:
+            lo = min(lo, min(line))
+            if lo == 0:
+                break
+    return lo
+
+
+# sips renders the grey alpha plane through colour management, so pure white
+# comes out as 254/255; anything at or above this counts as opaque.
+OPAQUE_THRESHOLD = 250
+
+
+def alpha_is_opaque(alpha_stream):
+    """True if a monochrome HEVC alpha stream is (practically) fully opaque.
+    WeChat attaches an alpha stream to many wxgf images whose plane is
+    uniformly 255; those are written as JPEG instead of PNG."""
+    return bmp_min_sample(_sips_convert(hevc_to_heic(alpha_stream), "bmp", "bmp")) >= OPAQUE_THRESHOLD
 
 
 # --------------------------------------------------------------------------
@@ -619,8 +765,8 @@ def main():
     ap.add_argument("files", nargs="*", help="要解码的 .dat 文件")
     ap.add_argument("-o", "--out", help="输出目录")
     ap.add_argument("--test", type=int, metavar="N", help="随机解码 N 个 .dat 文件并统计结果")
-    ap.add_argument("--wxgf", default="jpg", choices=["jpg", "png", "heic", "raw"],
-                    help="wxgf (HEVC) 图片的输出格式（默认 jpg）")
+    ap.add_argument("--wxgf", default="auto", choices=["auto", "jpg", "png", "heic", "raw"],
+                    help="wxgf (HEVC) 图片的输出格式（默认 auto：带透明通道时为 png，否则 jpg）")
     ap.add_argument("--aes-key", help="指定 16 字符的 V2 AES 密钥")
     ap.add_argument("--xor-key", help="指定 XOR 密钥（例如 0x5a）")
     ap.add_argument("--show-keys", action="store_true", help="显示推导出的密钥后退出")

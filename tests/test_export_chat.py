@@ -313,6 +313,60 @@ class ExportCliTest(unittest.TestCase):
         self.assertIn("新解码 1（其中仅缩略图 0）", out)
         self.assertEqual(os.listdir(files), [f"{IMAGE_MD5}.jpg"])
 
+    # -- stickers (emoji) -------------------------------------------------------
+    EMOJI_MD5 = "e" * 32
+    GIF = b"GIF89a\x01\x00\x01\x00" + b"\x00" * 20 + b";"
+
+    def add_emoji(self, ts=210):
+        self.add_msg(ALICE, 47, ALICE, ts,
+                     f'<msg><emoji md5="{self.EMOJI_MD5}" cdnurl="http://wxapp.tc.qq.com/s" '
+                     'aeskey="" len="10"/></msg>')
+
+    def test_emoji_from_cache_html_md_txt(self):
+        self.add_emoji()
+        cache = os.path.join(self.dec, "emoji_cache")
+        os.makedirs(cache)
+        with open(os.path.join(cache, f"{self.EMOJI_MD5}.gif"), "wb") as f:
+            f.write(self.GIF)
+        _, out = self.run_cli("Alice R", "-f", "html", "--images")
+        self.assertIn("表情: 导出 1，缺失 0", out)
+        html_text = self.read("Alice R_chat.html")
+        self.assertIn(f'<div class="bubble img emoji"><img loading="lazy" '
+                      f'src="Alice%20R_files/emoji_{self.EMOJI_MD5}.gif"', html_text)
+        self.assertIn(".bubble.emoji img{max-width:120px;max-height:120px}", html_text)
+        with open(os.path.join(self.out, "Alice R_files", f"emoji_{self.EMOJI_MD5}.gif"),
+                  "rb") as f:
+            self.assertEqual(f.read(), self.GIF)
+        self.run_cli("Alice R", "-f", "md", "--images")
+        self.assertIn(f"![[表情]](Alice%20R_files/emoji_{self.EMOJI_MD5}.gif)",
+                      self.read("Alice R_chat.md"))
+        # re-render without --images keeps the reference; txt unchanged
+        self.run_cli("Alice R", "-f", "json")
+        msgs = json.loads(self.read("Alice R_chat.json"))["messages"]
+        emo = [m for m in msgs if m["kind"] == "emoji"]
+        self.assertEqual(emo[0]["image_path"], f"Alice R_files/emoji_{self.EMOJI_MD5}.gif")
+        self.assertNotIn("emoji_xml", emo[0])
+        self.run_cli("Alice R", "--images")
+        self.assertIn("Alice R: [表情]", self.read("Alice R_chat.txt"))
+
+    def test_emoji_download_flag(self):
+        self.add_emoji()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            self.run_cli("Alice R", "-f", "html", "--download-emoji")
+        import emoticon
+        with mock.patch.object(emoticon, "fetch", return_value=self.GIF) as fetch:
+            _, out = self.run_cli("Alice R", "-f", "html", "--images")
+            fetch.assert_not_called()
+            self.assertIn("缺失 1", out)
+            self.assertIn("--download-emoji", out)
+            self.assertNotIn("bubble img emoji", self.read("Alice R_chat.html"))
+            _, out = self.run_cli("Alice R", "-f", "html", "--images", "--download-emoji")
+            fetch.assert_called_once_with("http://wxapp.tc.qq.com/s")
+        self.assertIn("新下载 1", out)
+        self.assertTrue(os.path.exists(os.path.join(self.dec, "emoji_cache",
+                                                    f"{self.EMOJI_MD5}.gif")))
+        self.assertIn("bubble img emoji", self.read("Alice R_chat.html"))
+
 
 if __name__ == "__main__":
     unittest.main()

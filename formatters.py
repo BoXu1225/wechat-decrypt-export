@@ -276,6 +276,7 @@ main{max-width:760px;margin:0 auto;padding:8px 12px 32px}
 .dur{font-size:12px;color:var(--muted);white-space:nowrap}
 .self .dur{color:inherit;opacity:.7}
 .bubble.img .dur{margin:2px 4px 0}
+.bubble.emoji img{max-width:120px;max-height:120px}
 .time{font-size:11px;color:var(--muted);margin:2px 6px 0}
 .sys{text-align:center;color:var(--muted);font-size:12px;margin:8px 0;white-space:pre-wrap}
 .bubble a{color:inherit}
@@ -373,7 +374,8 @@ def write_html(records, meta, fp, base_dir=None, **_):
         dur_html = (f"<span class=\"dur\">{esc(fmt_duration(r.get('kind'), dur))}</span>"
                     if dur is not None and r.get("kind") in ("voice", "video") else "")
         if img:
-            parts.append(f"<div class=\"bubble img\"><img loading=\"lazy\" "
+            cls = "bubble img emoji" if r.get("kind") == "emoji" else "bubble img"
+            parts.append(f"<div class=\"{cls}\"><img loading=\"lazy\" "
                          f"src=\"{esc(_rel_image(img, base_dir))}\" alt=\"{esc(text)}\"></div>")
         elif audio:
             parts.append(f"<div class=\"bubble voice\"><audio controls preload=\"none\" "
