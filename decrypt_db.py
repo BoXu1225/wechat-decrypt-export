@@ -55,10 +55,10 @@ def run_key_scanner():
     import subprocess
     if (not os.path.exists(SCANNER_BIN)
             or os.path.getmtime(SCANNER_BIN) < os.path.getmtime(SCANNER_SRC)):
-        print("编译密钥扫描器 ...")
+        print("[+] 编译密钥扫描器 ...")
         subprocess.run(["cc", "-O2", "-o", SCANNER_BIN, SCANNER_SRC,
                         "-framework", "Foundation"], check=True)
-    print("提取密钥需要 root 权限（微信必须正在运行，且已 ad-hoc 签名）")
+    print("[!] 提取密钥需要 root 权限（微信必须正在运行，且已 ad-hoc 签名）")
     subprocess.run(["sudo", SCANNER_BIN], cwd=PROJECT_ROOT, check=True)
 
 
@@ -74,13 +74,13 @@ def ensure_keys():
     if keys and not missing:
         return keys
     if keys:
-        print(f"{len(missing)} 个数据库缺少密钥或密钥已过期（例如 {missing[0]}），重新提取 ...")
+        print(f"[!] {len(missing)} 个数据库缺少密钥或密钥已过期（例如 {missing[0]}），重新提取 ...")
     else:
-        print(f"未找到密钥文件 {KEYS_FILE}，开始提取 ...")
+        print(f"[!] 未找到密钥文件 {KEYS_FILE}，开始提取 ...")
     try:
         run_key_scanner()
     except Exception as e:
-        print(f"[ERROR] 密钥提取失败: {e}")
+        print(f"[!] 密钥提取失败: {e}")
         if not keys:
             sys.exit(1)
 
@@ -140,19 +140,19 @@ def decrypt_database(db_path, out_path, enc_key):
     total_pages = file_size // PAGE_SZ
 
     if file_size % PAGE_SZ != 0:
-        print(f"  [WARN] 文件大小 {file_size} 不是 {PAGE_SZ} 的倍数")
+        print(f"  [!] 文件大小 {file_size} 不是 {PAGE_SZ} 的倍数")
         total_pages += 1
 
     with open(db_path, 'rb') as fin:
         page1 = fin.read(PAGE_SZ)
 
     if len(page1) < PAGE_SZ:
-        print(f"  [ERROR] 文件太小")
+        print(f"  [!] 文件太小")
         return False
 
     # 验证page 1
     if not page1_hmac_ok(page1, enc_key):
-        print(f"  [ERROR] Page 1 HMAC验证失败! salt: {page1[:SALT_SZ].hex()}")
+        print(f"  [!] Page 1 HMAC 验证失败! salt: {page1[:SALT_SZ].hex()}")
         return False
 
     print(f"  HMAC OK, {total_pages} pages")
@@ -173,7 +173,7 @@ def decrypt_database(db_path, out_path, enc_key):
 
             if pgno == 1:
                 if decrypted[:16] != SQLITE_HDR:
-                    print(f"  [WARN] 解密后header不匹配!")
+                    print(f"  [!] 解密后 header 不匹配!")
 
             if pgno % 10000 == 0:
                 print(f"  进度: {pgno}/{total_pages} ({100*pgno/total_pages:.1f}%)")
@@ -187,8 +187,8 @@ def main():
     print("=" * 60)
 
     keys = ensure_keys()
-    print(f"\n加载 {len(keys)} 个数据库密钥")
-    print(f"输出目录: {OUT_DIR}")
+    print(f"\n[+] 加载 {len(keys)} 个数据库密钥")
+    print(f"[+] 输出目录: {OUT_DIR}")
     os.makedirs(OUT_DIR, exist_ok=True)
 
     # 收集所有DB文件
@@ -203,7 +203,7 @@ def main():
 
     db_files.sort(key=lambda x: x[2])  # 从小到大
 
-    print(f"找到 {len(db_files)} 个数据库文件\n")
+    print(f"[+] 找到 {len(db_files)} 个数据库文件\n")
 
     success = 0
     skipped = 0
@@ -216,7 +216,7 @@ def main():
         rel_key = rel.replace('\\', '/')
         if rel_key not in keys:
             # 微信从未打开过的库（如 migrate/unspportmsg.db）内存里没有密钥，不算失败
-            print(f"SKIP: {rel} (无密钥)")
+            print(f"[!] 跳过: {rel}（无密钥）")
             no_key += 1
             continue
 
@@ -246,16 +246,16 @@ def main():
                 success += 1
                 total_bytes += sz
             except Exception as e:
-                print(f"  [WARN] SQLite验证失败: {e}")
+                print(f"  [!] SQLite 验证失败: {e}")
                 failed += 1
         else:
             failed += 1
 
     print(f"\n{'='*60}")
-    print(f"结果: {success} 成功, {skipped} 跳过(未变化), {no_key} 跳过(无密钥), {failed} 失败, 共 {len(db_files)} 个")
+    print(f"[+] 结果: {success} 成功, {skipped} 跳过(未变化), {no_key} 跳过(无密钥), {failed} 失败, 共 {len(db_files)} 个")
     if total_bytes > 0:
-        print(f"本次解密: {total_bytes/1024/1024/1024:.1f}GB")
-    print(f"解密文件在: {OUT_DIR}")
+        print(f"[+] 本次解密: {total_bytes/1024/1024/1024:.1f}GB")
+    print(f"[+] 解密文件在: {OUT_DIR}")
 
 
 if __name__ == '__main__':

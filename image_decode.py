@@ -600,14 +600,14 @@ def _run_test(n, out_dir, aes_key, xor_key, wechat_base_dir, wxgf_to):
             fail[(fmt, _variant(p))] += 1
             errors[type(e).__name__ + ": " + str(e)[:80]] += 1
     total = sum(ok.values()) + sum(fail.values())
-    print("tested %d files: %d ok, %d failed (%.1f%%)" % (
+    print("[+] 测试 %d 个文件: %d 成功, %d 失败 (%.1f%%)" % (
         total, sum(ok.values()), sum(fail.values()),
         100.0 * sum(ok.values()) / total if total else 0))
-    print("ok by (dat format, variant, payload):")
+    print("成功（dat 格式, 变体, 图片格式）:")
     for k, v in sorted(ok.items()):
         print("  %6d  %s" % (v, k))
     if fail:
-        print("failed by (dat format, variant):")
+        print("失败（dat 格式, 变体）:")
         for k, v in sorted(fail.items()):
             print("  %6d  %s" % (v, k))
         for k, v in errors.most_common(5):
@@ -615,15 +615,15 @@ def _run_test(n, out_dir, aes_key, xor_key, wechat_base_dir, wxgf_to):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Decode WeChat 4.x .dat chat images")
-    ap.add_argument("files", nargs="*", help=".dat files to decode")
-    ap.add_argument("-o", "--out", help="output directory")
-    ap.add_argument("--test", type=int, metavar="N", help="decode N random .dat files and report")
+    ap = argparse.ArgumentParser(description="解码微信 4.x 聊天图片 .dat 文件")
+    ap.add_argument("files", nargs="*", help="要解码的 .dat 文件")
+    ap.add_argument("-o", "--out", help="输出目录")
+    ap.add_argument("--test", type=int, metavar="N", help="随机解码 N 个 .dat 文件并统计结果")
     ap.add_argument("--wxgf", default="jpg", choices=["jpg", "png", "heic", "raw"],
-                    help="output format for wxgf (HEVC) images (default jpg)")
-    ap.add_argument("--aes-key", help="override the 16-char V2 AES key")
-    ap.add_argument("--xor-key", help="override the XOR key (e.g. 0x5a)")
-    ap.add_argument("--show-keys", action="store_true", help="print derived keys and exit")
+                    help="wxgf (HEVC) 图片的输出格式（默认 jpg）")
+    ap.add_argument("--aes-key", help="指定 16 字符的 V2 AES 密钥")
+    ap.add_argument("--xor-key", help="指定 XOR 密钥（例如 0x5a）")
+    ap.add_argument("--show-keys", action="store_true", help="显示推导出的密钥后退出")
     args = ap.parse_args()
 
     cfg = _load_cfg()
@@ -639,8 +639,8 @@ def main():
         print("image_xor_key:", "0x%02x" % xor_key if xor_key is not None else None)
         return
     if aes_key is None:
-        print("[!] V2 AES key not found (no kvcomm/key_<uin>_*.statistic matched); "
-              "V2 files will fail. Set image_aes_key in config.json.")
+        print("[!] 未找到 V2 AES 密钥（没有匹配的 kvcomm/key_<uin>_*.statistic），"
+              "V2 格式图片将无法解码；可在 config.json 中设置 image_aes_key")
     if args.out:
         os.makedirs(args.out, exist_ok=True)
 
@@ -648,7 +648,7 @@ def main():
         _run_test(args.test, args.out, aes_key, xor_key, cfg["wechat_base_dir"], wxgf_to)
         return
     if not args.files:
-        ap.error("give .dat files or --test N")
+        ap.error("请指定 .dat 文件或 --test N")
     out_dir = args.out or "."
     for p in args.files:
         try:
@@ -660,7 +660,7 @@ def main():
         dst = os.path.join(out_dir, base + "." + ext)
         with open(dst, "wb") as f:
             f.write(data)
-        print("[+] %s -> %s (%d bytes)" % (os.path.basename(p), dst, len(data)))
+        print("[+] %s -> %s (%d 字节)" % (os.path.basename(p), dst, len(data)))
 
 
 if __name__ == "__main__":

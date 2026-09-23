@@ -17,7 +17,7 @@ WECHAT_DST="${WECHAT_DST:-${HOME}/WeChat.app}"
 ok()   { echo "[+] $*"; }
 info() { echo "    $*"; }
 warn() { echo "[!] $*"; }
-die()  { echo "[ERROR] $*" >&2; exit 1; }
+die()  { echo "[!] $*" >&2; exit 1; }
 
 # Ask a y/N question; anything but y/yes (including EOF / no tty) means no
 confirm() {
