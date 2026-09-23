@@ -2,77 +2,71 @@
 
 [中文](README.md)
 
-Our data, we own it! Decrypt WeChat 4.x (macOS) local SQLCipher 4 databases and export chat history to readable text files.
+Our data, we own it! Decrypt WeChat 4.x (macOS) local SQLCipher 4 databases and export your chats — 1-on-1 and group — as text, Markdown, HTML, JSON or CSV, with images.
 
-## How it works
+## Setup
 
-WeChat 4.x encrypts local databases with SQLCipher 4:
-- **Encryption**: AES-256-CBC + HMAC-SHA512
-- **KDF**: PBKDF2-HMAC-SHA512, 256,000 iterations
-- **Page size**: 4096 bytes, reserve = 80 (IV 16 + HMAC 64)
-- **Each database has its own salt and encryption key**
+Requirements: macOS (Apple Silicon / Intel), WeChat 4.x logged in.
 
-WCDB (WeChat's SQLCipher wrapper) caches derived raw keys in process memory as `x'<64hex_enc_key><32hex_salt>'`. This tool scans process memory for that pattern, matches keys to databases by salt, and decrypts them.
+```bash
+./setup.sh
+```
 
-Message content may be zstd-compressed (WCDB_CT=4, no dictionary). The export step handles decompression automatically.
+`setup.sh` is safe to rerun. It checks for Xcode Command Line Tools and Python 3.10+, creates `venv/` and installs dependencies, compiles the key scanner, and — after asking you — makes an **ad-hoc signed copy of WeChat** at `~/WeChat.app` (required so the scanner can read WeChat's memory; SIP prevents signing the copy in `/Applications`). Quit WeChat and launch `~/WeChat.app` from then on.
 
-## Prerequisites
-
-- **macOS** (Apple Silicon / Intel)
-- WeChat 4.x running and logged in
-- Xcode Command Line Tools: `xcode-select --install`
-- Python 3.10+ with dependencies: `pip install -r requirements.txt`
-- WeChat must be **ad-hoc signed** (required for memory access):
-  ```bash
-  # SIP blocks signing in /Applications, so copy first
-  cp -R /Applications/WeChat.app ~/WeChat.app
-  codesign --force --deep --sign - ~/WeChat.app
-  # Launch ~/WeChat.app instead of the original
-  ```
+After a WeChat update, install it to `/Applications` as usual and rerun `./setup.sh`: it detects the version change and offers to re-copy and re-sign.
 
 ## Quick start
 
-One command does everything; the first run handles all setup automatically:
-
 ```bash
-python export_chat.py ning
+./wechat ning                  # export one chat (fuzzy name match, pick from a list if several)
+./wechat --list                # list all chats: name, type, message count, last message
+./wechat --all                 # export every chat (incremental)
 ```
 
-It will:
-1. **Extract keys** — on first run, when a new database appears, or when a key goes stale, it compiles and runs `find_all_keys_macos` (asks for your sudo password; WeChat must be open)
-2. **Decrypt databases** — into `decrypted/`, only the ones that changed, validated with HMAC and a SQLite integrity check
-3. **Export the chat**
+`./wechat` runs `export_chat.py` with the project's venv from any directory (you can symlink it into `~/bin`). Each run automatically:
 
-You can also run decryption on its own: `python decrypt_db.py`
+1. **Extracts keys** when needed — on first run, when WeChat creates a new database, or when a key goes stale. This runs the scanner with `sudo` (asks for your password; WeChat must be open). Otherwise it's skipped.
+2. **Decrypts** only the databases that changed since last time, into `decrypted/`, checking HMAC and SQLite integrity.
+3. **Exports**.
 
-### Export options
+Decrypt on its own with `./wechat decrypt`.
+
+## Exporting
 
 ```bash
-# Fuzzy search for a contact (partial match, interactive selection)
-python export_chat.py ning
-
-# Specify output file
-python export_chat.py xxx -o chats/output.txt
-
-# Incremental export (outputs to export/<contact>/output_0.txt, output_1.txt, ...)
-python export_chat.py xxx -i
+./wechat ning -f html --images           # chat-style HTML page with images
+./wechat ning -i                         # incremental: append new messages to export/<name>.txt
+./wechat ning --since 2026-01-01 --until 2026-06-30
+./wechat --all --type group -f md        # all group chats as Markdown
+./wechat --list 同学                      # list chats whose name contains 同学
 ```
 
-Options:
-- `-o`, `--output` — output file path (default: `export/<contact>_chat.txt`)
-- `-d`, `--decrypted-dir` — custom path to decrypted databases
-- `-i`, `--incremental` — incremental export, only exports messages newer than the last export
+| Option | Meaning |
+|---|---|
+| `contact` | Remark / nickname / group name, partial match. With `--list` / `--all` it filters by name |
+| `-f`, `--format` | `txt` (default), `md`, `html`, `json`, `csv` |
+| `-i`, `--incremental` | Export to `export/<name>.<ext>`; txt/md/csv append only new messages, html/json are regenerated |
+| `--all` | Incremental export of every chat |
+| `--list [filter]` | List chats |
+| `--type` | `all` (default), `single` (1-on-1), `group` |
+| `--images` | Decode images into `export/<name>_files/` and embed them in md/html/json (txt/csv show `[图片]`) |
+| `--since` / `--until` | Date range, `YYYY-MM-DD`, inclusive |
+| `-o`, `--output` | Output file (default `export/<name>_chat.<ext>`) |
+| `--export-dir` | Export folder (default `export/`) |
+| `-d`, `--decrypted-dir` | Decrypted database folder |
+| `--no-decrypt` | Skip the automatic decrypt step |
 
-The exporter:
-- Supports fuzzy contact search (case-insensitive partial matching)
-- Searches across all `message_*.db` files (chats can span multiple DBs)
-- Resolves per-DB Name2Id rowid mappings correctly
-- Decompresses zstd-encoded messages (CT=4)
-- Formats message types: text, images, stickers, links, quotes, files, mini programs, system messages
+What the exporter handles:
+- **Group chats**: each message shows the sender's group nickname, else your remark/their nickname
+- **Chats spanning several databases** (`message_0.db`, `message_1.db`, … — roughly one per year)
+- **Message types**: text, images, voice, video, stickers, links, files, quotes, mini programs, system messages; zstd-compressed messages are decompressed
+- **Images**: WeChat 4.x encrypted `.dat` images (including the HEVC-based wxgf format, converted to JPEG with macOS's built-in `sips`). The image key is derived from local account files — no extra `sudo` needed. When WeChat only has a thumbnail (full image never downloaded), the thumbnail is used and upgraded on a later export once the full image exists
+- **Old incremental layout**: if you used the previous `export/<name>/output_N.txt` layout, the first incremental export merges those files into `export/<name>.txt`; the old folder can then be deleted
 
 ## Configuration
 
-No setup needed: on first run the WeChat data folder is auto-detected and saved to `config.json` (you pick one if there are multiple accounts). Your own WeChat ID is derived from the folder name. To override, edit `config.json`:
+Nothing to configure: on first run the WeChat data folder is auto-detected and saved to `config.json` (you pick one if there are several accounts), and your own WeChat ID is derived from the folder name. To override, edit `config.json`:
 
 ```json
 {
@@ -83,18 +77,34 @@ No setup needed: on first run the WeChat data folder is auto-detected and saved 
 }
 ```
 
-Find `db_dir` by browsing `~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/`.
+Optional: `image_aes_key` (16 characters) and `image_xor_key` override the automatically derived image keys.
+
+## How it works
+
+WeChat 4.x encrypts local databases with SQLCipher 4:
+- **Encryption**: AES-256-CBC + HMAC-SHA512
+- **KDF**: PBKDF2-HMAC-SHA512, 256,000 iterations
+- **Page size**: 4096 bytes, reserve = 80 (IV 16 + HMAC 64)
+- **Each database has its own salt and key**
+
+WCDB (WeChat's SQLCipher wrapper) caches derived raw keys in process memory as `x'<64hex_enc_key><32hex_salt>'`. The scanner finds that pattern in WeChat's memory and matches keys to databases by salt. Before decrypting, each key is checked against page 1's HMAC, so stale keys are detected and re-extracted automatically.
+
+Each chat's messages live in tables named `Msg_<md5(username)>`; message content may be zstd-compressed (WCDB_CT=4). Chat images are stored as `.dat` files under `msg/attach/<md5(username)>/<YYYY-MM>/Img/`, the first 1 KB AES-128-ECB encrypted and the rest XOR'd.
 
 ## Files
 
 | File | Purpose |
 |------|---------|
+| `setup.sh` | One-time environment setup (venv, scanner, WeChat signing) |
+| `wechat` | Launcher: `./wechat …` → export, `./wechat decrypt` → decrypt |
 | `find_all_keys_macos.c` | C — scans WeChat process memory for SQLCipher keys (Mach VM API) |
-| `decrypt_db.py` | Decrypts all databases using extracted keys |
-| `export_chat.py` | Exports a 1-on-1 chat to a text file |
-| `config.py` | Config loader |
-| `config.json` | Your local configuration |
-| `requirements.txt` | Python dependencies |
+| `decrypt_db.py` | Decrypts changed databases; extracts keys automatically when missing or stale |
+| `export_chat.py` | Command line: search, list, export |
+| `chats.py` | Chat discovery, contacts, group sender names, message parsing |
+| `formatters.py` | txt / md / html / json / csv writers |
+| `image_decode.py` | Decodes WeChat `.dat` images and maps messages to image files |
+| `config.py` | Config loader and auto-detection |
+| `tests/` | Unit tests (synthetic data): `./venv/bin/python -m unittest discover -s tests` |
 
 ## Acknowledgments
 
