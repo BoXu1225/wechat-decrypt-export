@@ -398,9 +398,9 @@ class DispatchTest(Base):
         async def go():
             async with Client(srv) as client:
                 tools = {t.name for t in (await client.list_tools()).tools}
-                self.assertEqual(tools, {"list_chats", "get_messages", "search_messages",
+                self.assertLessEqual({"list_chats", "get_messages", "search_messages",
                                          "get_message_context", "get_contact", "get_image",
-                                         "refresh"})
+                                         "refresh"}, tools)
                 r = await client.call_tool("list_chats", {"type": "single"})
                 payload = json.loads(r.content[0].text)
                 self.assertEqual(payload["chats"][0]["username"], ALICE)
@@ -451,7 +451,7 @@ class RefreshTest(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="mcp_refresh_")
         self.db_dir = os.path.join(self.tmp, "db_storage")
         self.out = os.path.join(self.tmp, "decrypted")
-        for rel in ("message/message_0.db", "contact/contact.db", "sns/sns.db"):
+        for rel in ("message/message_0.db", "contact/contact.db", "general/general.db"):
             p = os.path.join(self.db_dir, rel)
             os.makedirs(os.path.dirname(p), exist_ok=True)
             with open(p, "wb") as f:
@@ -459,7 +459,7 @@ class RefreshTest(unittest.TestCase):
         self.key = "11" * 32
         self.keys_file = os.path.join(self.tmp, "keys.json")
         self.write_keys({"message/message_0.db": self.key, "contact/contact.db": self.key,
-                         "sns/sns.db": self.key})
+                         "general/general.db": self.key})
         self.fake = FakeDecryptor(bytes.fromhex(self.key))
         self.data = M.WeChatData({"decrypted_dir": self.out, "db_dir": self.db_dir,
                                   "keys_file": self.keys_file, "self_wxid": SELF,
@@ -479,13 +479,13 @@ class RefreshTest(unittest.TestCase):
         with contextlib.redirect_stdout(buf):
             r = self.data.refresh()
         self.assertEqual(buf.getvalue(), "")  # decryptor prints went to stderr
-        self.assertEqual(r["updated"], ["contact/contact.db", "message/message_0.db"])  # not sns
+        self.assertEqual(r["updated"], ["contact/contact.db", "message/message_0.db"])  # not general
         self.assertNotIn("action_required", r)
         self.assertFalse(any(f.endswith(".mcp_tmp") for _, _, fs in os.walk(self.out) for f in fs))
         r = self.data.refresh()
         self.assertEqual((r["updated"], r["unchanged"]), ([], 2))
         r = self.data.refresh(all_dbs=True)
-        self.assertEqual(r["updated"], ["sns/sns.db"])
+        self.assertEqual(r["updated"], ["general/general.db"])
 
         # Changed DB whose key no longer validates -> stale, told to run ./wechat decrypt.
         src = os.path.join(self.db_dir, "message", "message_0.db")

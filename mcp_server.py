@@ -29,6 +29,9 @@ Tools (all read-only; results are compact JSON, times are local ISO strings):
     get_contact(name)
     get_image(chat, message_id)
     refresh(all_dbs=False)
+    get_moments(author=None, since=None, until=None, limit=50, query=None)
+    search_favorites(query=None, type=None, since=None, until=None, limit=50)
+    get_favorite(id)
 
 `chat` accepts a username, an exact name (remark/nickname/alias), or a
 unique substring; an ambiguous name returns {"error": "ambiguous",
@@ -1019,6 +1022,7 @@ def build_server(data, log, lifespan=None):
         a = dict(all_dbs=all_dbs)
         return run("refresh", a, lambda: data.refresh(**a))
 
+    register_social_tools(srv, data, log, ro)
     return srv
 
 
@@ -1065,6 +1069,277 @@ def main(argv=None):
         yield {}
 
     build_server(data, log, lifespan=lifespan).run("stdio")
+
+
+# ---------------------------------------------------------------------------
+# Moments (朋友圈) and Favorites (收藏) tools
+# ---------------------------------------------------------------------------
+# Kept in one appended block (logic lives in moments.py / favorites.py).
+# Access policy: a Moments post is visible iff its author is visible (the
+# user's own posts unless they are blocklisted by name/username); likes and
+# comments on a visible post stay visible, like group messages. A favorite is
+# hidden if any chat/sender it came from (other than the user) is hidden.
+
+MAX_COMMENTS = 100       # per post in get_moments
+MAX_ITEMS = 200          # dataitems per favorite in get_favorite
+
+# Auto-refresh also re-decrypts the Moments and Favorites databases.
+_WANTED_DB_RE = re.compile(f"(?:{_WANTED_DB_RE.pattern})"
+                           r"|^(?:sns/sns\.db|favorite/favorite\.db)$")
+
+
+def _file_sig(path):
+    try:
+        st = os.stat(path)
+        return st.st_mtime, st.st_size
+    except FileNotFoundError:
+        return None
+
+
+def _social_cached(data, key, db_rel, build):
+    """Per-WeChatData cache invalidated by the DB file or contacts changing."""
+    cache = data.__dict__.setdefault("_social_cache", {})
+    sig = (_file_sig(os.path.join(data.decrypted_dir, db_rel)), data._data_sig()[:1])
+    hit = cache.get(key)
+    if hit and hit[0] == sig:
+        return hit[1]
+    val = build()
+    cache[key] = (sig, val)
+    return val
+
+
+def _self_visible(data):
+    if not data.blocklist:
+        return True
+    r = data.contact_rows().get(data.self_wxid, {})
+    names = {data.self_wxid, r.get("display"), r.get("remark"), r.get("nick_name"),
+             r.get("alias")} - {"", None}
+    return not (names & data.blocklist)
+
+
+def _user_visible(data, username):
+    if username and username == data.self_wxid:
+        return _self_visible(data)
+    return data.is_visible(username)
+
+
+def _moment_posts(data):
+    import moments as MO
+
+    def build():
+        posts = MO.load_posts(data.decrypted_dir)
+        MO.resolve_names(posts, data.contacts(), data.self_wxid)
+        return posts
+    return _social_cached(data, "moments", MO.SNS_DB, build)
+
+
+def _moment_cache(data):
+    import moments as MO
+    mc = data.__dict__.get("_moment_media")
+    if mc is None:
+        mc = data.__dict__["_moment_media"] = MO.MediaCache(data.cfg.get("wechat_base_dir"))
+    return mc
+
+
+def _resolve_moment_author(data, query, posts):
+    import moments as MO
+    q = str(query).strip()
+    if data.self_wxid and q.lower() in MO.SELF_ALIASES:
+        if not _self_visible(data):
+            raise ToolError(f"no Moments author matches {q!r}")
+        return [data.self_wxid]
+    visible = [p for p in posts if _user_visible(data, p["username"])]
+    names = MO.author_names(visible, data.contact_rows())
+    hits = [u for u, s in names.items() if q in s] or \
+        [u for u, s in names.items() if q.lower() in {x.lower() for x in s}] or \
+        [u for u, s in names.items() if any(q.lower() in x.lower() for x in s)]
+    if not hits:
+        raise ToolError(f"no Moments author matches {q!r}",
+                        hint="only people whose posts WeChat has cached locally have Moments")
+    if len(hits) > 1:
+        counts = {}
+        for p in visible:
+            counts[p["username"]] = counts.get(p["username"], 0) + 1
+        first = {p["username"]: p["author"] for p in reversed(visible)}
+        raise ToolError("ambiguous", query=q, candidates=[
+            {"name": first.get(u, u), "username": u, "posts": counts.get(u, 0)}
+            for u in sorted(hits, key=lambda u: -counts.get(u, 0))[:MAX_CANDIDATES]],
+            hint="call again with one candidate's username")
+    return hits
+
+
+def _moment_out(p, cache):
+    d = {"id": p["id"], "time": iso(p["ts"]), "author": p["author"],
+         "author_username": p["username"]}
+    if p["kind"] != "image":
+        d["kind"] = p["kind"]
+    if p["text"]:
+        d["text"] = _cap_text(p["text"])
+    for k in ("title", "description", "url", "source"):
+        if p.get(k):
+            d[k] = _cap_text(p[k])
+    if p.get("private"):
+        d["private"] = True
+    if p["location"]:
+        d["location"] = p["location"]["name"] or p["location"]["address"]
+    media = [m for m in p["media"] if m["type"] in ("image", "video")]
+    if media:
+        cached = sum(1 for m in media if any(cache.lookup(p["id"], m["id"]).values()))
+        d["media"] = {"images": sum(m["type"] == "image" for m in media),
+                      "videos": sum(m["type"] == "video" for m in media),
+                      "cached_locally": cached}
+    if p.get("with_names"):
+        d["with"] = p["with_names"]
+    if p["likes"]:
+        d["likes"] = [x["name"] for x in p["likes"]]
+    if p["comments"]:
+        cs = []
+        for c in p["comments"][:MAX_COMMENTS]:
+            x = {"name": c["name"], "time": iso(c["ts"]), "text": _cap_text(c["text"])}
+            if c.get("reply_to"):
+                x["reply_to"] = c.get("reply_to_name") or c["reply_to"]
+            cs.append(x)
+        d["comments"] = cs
+        if len(p["comments"]) > MAX_COMMENTS:
+            d["comments_truncated"] = len(p["comments"]) - MAX_COMMENTS
+    return d
+
+
+def moments_query(data, author=None, since=None, until=None, limit=50, query=None):
+    import moments as MO
+    limit = clamp(limit, 1, MAX_LIMIT)
+    posts = _moment_posts(data)
+    t_since, t_until = parse_time(since), parse_time(until, end=True)
+    authors = _resolve_moment_author(data, author, posts) if author else None
+    hits = [p for p in MO.filter_posts(posts, authors, query, t_since,
+                                       t_until + 1 if t_until is not None else None)
+            if _user_visible(data, p["username"])]
+    cache = _moment_cache(data)
+    out = {"total": len(hits), "count": min(limit, len(hits)), "has_more": len(hits) > limit,
+           "posts": [_moment_out(p, cache) for p in hits[:limit]]}
+    if not posts:
+        out["note"] = "no Moments in the local database (sns/sns.db missing or empty)"
+    return out
+
+
+def _favorites(data):
+    import favorites as FV
+
+    def build():
+        favs = FV.load_favorites(data.decrypted_dir)
+        FV.resolve_names(favs, data.contacts(), data.self_wxid)
+        return favs
+    return _social_cached(data, "favorites", FV.FAV_DB, build)
+
+
+def _fav_visible(data, f):
+    import favorites as FV
+    return all(_user_visible(data, u) for u in FV.related_usernames(f) if u != data.self_wxid)
+
+
+def _fav_source(f):
+    s = f["source"]
+    d = {k: s[k] for k in ("sender_name", "chat_name") if s.get(k)}
+    if s.get("from"):
+        d["chat_username"] = s["from"]
+    return d
+
+
+def favorites_search(data, query=None, type=None, since=None, until=None, limit=50):
+    import favorites as FV
+    limit = clamp(limit, 1, MAX_LIMIT)
+    if type not in (None, "") and not str(type).isdigit() and type not in FV.KIND_LABEL:
+        raise ToolError(f"unknown type {type!r}", valid=sorted(FV.KIND_LABEL))
+    t_since, t_until = parse_time(since), parse_time(until, end=True)
+    favs = [f for f in FV.search(_favorites(data), query, type, t_since,
+                                 t_until + 1 if t_until is not None else None)
+            if _fav_visible(data, f)]
+    terms = (query or "").split()
+    res = []
+    for f in favs[:limit]:
+        d = {"id": f["id"], "time": iso(f["ts"]), "type": f["kind"]}
+        if f["title"]:
+            d["title"] = _cap_text(f["title"])
+        text = f["desc"] or FV.summary_text(f, 10_000)
+        if text and text != f["title"]:
+            d["snippet"] = _snippet(text, terms) if terms else _snippet(text, [], 100)
+        if f["url"]:
+            d["url"] = f["url"]
+        src = _fav_source(f)
+        if src:
+            d["source"] = src
+        if f["tags"]:
+            d["tags"] = f["tags"]
+        if len(f["items"]) > 1:
+            d["item_count"] = len(f["items"])
+        res.append(d)
+    return {"total": len(favs), "count": len(res), "has_more": len(favs) > limit,
+            "favorites": res, "hint": "get_favorite(id) for the full item (e.g. chat records)"}
+
+
+def favorite_get(data, id):
+    import favorites as FV
+    try:
+        fid = int(str(id).strip())
+    except (TypeError, ValueError):
+        raise ToolError(f"bad favorite id {id!r}; expected an integer from search_favorites")
+    f = next((x for x in _favorites(data) if x["id"] == fid), None)
+    if f is None or not _fav_visible(data, f):
+        raise ToolError(f"favorite {fid} not found")
+    d = {"id": f["id"], "time": iso(f["ts"]), "type": f["kind"], "title": f["title"] or None,
+         "text": _cap_text(f["desc"]) or None, "url": f["url"] or None,
+         "source": _fav_source(f) or None, "tags": f["tags"] or None,
+         "location": f["location"]}
+    items = []
+    for it in f["items"][:MAX_ITEMS]:
+        x = {"type": it["kind"]}
+        for k in ("title", "desc", "sender_name", "time", "url", "fmt", "size", "duration"):
+            if it.get(k):
+                x[k] = _cap_text(it[k]) if isinstance(it[k], str) else it[k]
+        items.append(x)
+    d["items"] = items
+    if len(f["items"]) > MAX_ITEMS:
+        d["items_truncated"] = len(f["items"]) - MAX_ITEMS
+    return {k: v for k, v in d.items() if v is not None}
+
+
+def register_social_tools(srv, data, log, ro):
+    from typing import Optional
+
+    def run(tool, args, fn):
+        return dumps(call_tool(data, log, tool, args, fn))
+
+    @srv.tool(annotations=ro, structured_output=False)
+    def get_moments(author: Optional[str] = None, since: Optional[str] = None,
+                    until: Optional[str] = None, limit: int = 50,
+                    query: Optional[str] = None) -> str:
+        """Moments (朋友圈) posts cached locally by WeChat, newest first: the user's own
+        and friends' posts the app has loaded. author: name/remark/username of the poster
+        ("我" = the user); query: space-separated terms (all must match) over post text,
+        link title, location and comments. Each post: id, time, author, kind (omitted for
+        photo posts), text, title/url for shared links, location, media counts, likes
+        (names) and comments (name, time, text, reply_to). limit max 500."""
+        a = dict(author=author, since=since, until=until, limit=limit, query=query)
+        return run("get_moments", a, lambda: moments_query(data, **a))
+
+    @srv.tool(annotations=ro, structured_output=False)
+    def search_favorites(query: Optional[str] = None, type: Optional[str] = None,
+                         since: Optional[str] = None, until: Optional[str] = None,
+                         limit: int = 50) -> str:
+        """Search the user's WeChat Favorites (收藏), newest first. query: space-separated
+        terms (substring, all must match) over title, text, URL, tags, source names and
+        chat-record contents; omit to list. type: text, image, voice, video, link, location,
+        music, file, chat_record, note, miniprogram, channels, product, other.
+        Returns id, time, type, title, snippet, url, source, tags."""
+        a = dict(query=query, type=type, since=since, until=until, limit=limit)
+        return run("search_favorites", a, lambda: favorites_search(data, **a))
+
+    @srv.tool(annotations=ro, structured_output=False)
+    def get_favorite(id: int) -> str:
+        """One favorite in full by id (from search_favorites), including every entry of a
+        saved chat record or note (sender, time, text)."""
+        a = dict(id=id)
+        return run("get_favorite", a, lambda: favorite_get(data, **a))
 
 
 if __name__ == "__main__":
