@@ -1,5 +1,7 @@
 # WeChat macOS Database Decryptor & Chat Exporter
 
+[![CI](https://github.com/BoXu1225/wechat-decrypt-export/actions/workflows/ci.yml/badge.svg)](https://github.com/BoXu1225/wechat-decrypt-export/actions/workflows/ci.yml)
+
 [中文](README.md)
 
 Our data, we own it! Decrypt WeChat 4.x (macOS) local SQLCipher 4 databases and export your chats — 1-on-1 and group — as text, Markdown, HTML, JSON or CSV, with images.
@@ -113,3 +115,7 @@ Inspired by [wechat-decrypt](https://github.com/ylytdeng/wechat-decrypt) by [@yl
 ## Disclaimer
 
 This tool is for personal use only — to access **your own** WeChat data on your own machine. Respect applicable laws and do not use it for unauthorized data access.
+
+## License
+
+[MIT](LICENSE)
