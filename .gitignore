@@ -2,7 +2,7 @@
 all_keys.json
 wechat_key.txt
 config.json
-decrypted/
+decrypted
 decoded_images/
 *.db
 *.db-shm
@@ -27,3 +27,6 @@ Thumbs.db
 # files specific to this project
 export/
 find_all_keys_macos
+
+# Python virtualenv (created by setup.sh)
+venv
