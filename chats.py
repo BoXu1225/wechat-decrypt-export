@@ -32,6 +32,8 @@ import time
 
 import zstandard
 
+import msg_parse
+
 SELF_DISPLAY = "我"
 SYSTEM_DISPLAY = "系统"
 
@@ -52,7 +54,6 @@ SYSTEM_USERNAMES = frozenset({
 _GROUP_PREFIX_RE = re.compile(r"^([A-Za-z0-9_\-@.]+):\n")
 _FROMUSER_RE = re.compile(
     r'fromusername\s*=\s*"([^"]+)"|<fromusername>(?:<!\[CDATA\[)?([^<\]]+)')
-_APPTYPE_RE = re.compile(r"<type>(\d+)</type>")
 
 
 # ---------------------------------------------------------------------------
@@ -73,91 +74,19 @@ def decompress_if_needed(content, ct):
     return None
 
 
-def format_message(text, local_type):
-    base_type = local_type & 0xFF
-    sub_type = local_type >> 32
-
-    if base_type == 1:
-        return text if text else None
-    if base_type == 3:
-        return "[图片]"
-    if base_type == 34:
-        return "[语音]"
-    if base_type == 43:
-        return "[视频]"
-    if base_type == 47:
-        return "[表情]"
-    if base_type == 48:
-        return "[位置]"
-
-    # System message (10000 & 0xFF = 16)
-    if base_type == 16:
-        if text:
-            clean = re.sub(r"<[^>]+>", "", text).strip()
-            return f"[系统消息] {clean}" if clean else "[系统消息]"
-        return "[系统消息]"
-
-    # App message (base=49)
-    if base_type == 49:
-        if not text:
-            return _format_app_by_sub(sub_type)
-
-        m = re.search(r"<type>(\d+)</type>", text)
-        app_type = int(m.group(1)) if m else sub_type
-
-        if app_type == 8:
-            return "[表情]"
-
-        m = re.search(r"<title>(.*?)</title>", text, re.DOTALL)
-        if m:
-            title = m.group(1).strip()
-            if title:
-                if app_type == 57:
-                    return title
-                if app_type == 5:
-                    return f"[链接] {title}"
-                if app_type == 4:
-                    return f"[表情包] {title}"
-                if app_type == 6:
-                    return f"[文件] {title}"
-                if app_type in (33, 36):
-                    return f"[小程序] {title}"
-                return title
-
-        return _format_app_by_sub(sub_type)
-
-    if base_type == 248:
-        return None
-
-    if text and len(text) < 500 and not text.startswith("<?xml"):
-        return text
-    return f"[消息类型:{local_type}]"
+def format_message(text, local_type, resolve=None):
+    """One-line display text for a message (None: drop it). See msg_parse."""
+    return msg_parse.parse(text, local_type, resolve)[0]
 
 
-def _format_app_by_sub(sub_type):
-    labels = {4: "[表情包]", 5: "[链接]", 6: "[文件]", 8: "[表情]",
-              33: "[小程序]", 36: "[小程序]", 57: "[引用消息]"}
-    return labels.get(sub_type, f"[应用消息:{sub_type}]")
-
-
-# ---------------------------------------------------------------------------
-# Kind classification
-# ---------------------------------------------------------------------------
-
-_BASE_KIND = {1: "text", 3: "image", 34: "voice", 43: "video", 47: "emoji",
-              48: "location", 10000: "system", 10002: "system"}
-_APP_KIND = {3: "link", 4: "link", 5: "link", 6: "file", 8: "emoji",
-             33: "miniprogram", 36: "miniprogram", 57: "quote"}
+def parse_message(text, local_type, resolve=None):
+    """(display text or None, extra dict or None, kind). See msg_parse."""
+    return msg_parse.parse(text, local_type, resolve)
 
 
 def message_kind(local_type, text):
     """Map a raw local_type (+ decoded content) to a coarse kind string."""
-    base = local_type & 0xFFFFFFFF
-    if base == 49:
-        m = _APPTYPE_RE.search(text) if text else None
-        app_type = int(m.group(1)) if m else local_type >> 32
-        return _APP_KIND.get(app_type, "other")
-    return _BASE_KIND.get(base, "other")
+    return msg_parse.kind_of(local_type, text)
 
 
 # ---------------------------------------------------------------------------
@@ -552,7 +481,10 @@ def iter_messages(chat, decrypted_dir, self_wxid, contacts, group_nicknames=None
     """Yield message records for a chat, sorted by time.
 
     Record: {ts, sender, is_self, kind, text, local_type, local_id,
-             server_id, create_time}
+             server_id, create_time[, extra]}
+    extra (only when there is something to add) holds structured details of
+    rich messages (quote, link url, transfer amount, chat bundle items, ...);
+    see msg_parse for the schema.
     with_packed_info=True adds "packed_info_data" (bytes or None) to image
     records (kind "image"); it holds the image file md5 (see image_decode).
     Messages whose formatted text is None are dropped.
@@ -578,6 +510,18 @@ def iter_messages(chat, decrypted_dir, self_wxid, contacts, group_nicknames=None
         if user == username:
             return chat_name
         return contacts.get(user, user)
+
+    def resolve(user):
+        """Display name for a username seen inside message XML; None if unknown."""
+        if not user:
+            return None
+        if user == self_wxid:
+            return SELF_DISPLAY
+        if group and room_nicks.get(user):
+            return room_nicks[user]
+        if user == username:
+            return chat_name
+        return contacts.get(user)
 
     records = []
     for db_path, table in chat["tables"]:
@@ -612,7 +556,7 @@ def iter_messages(chat, decrypted_dir, self_wxid, contacts, group_nicknames=None
                 if not sender and (local_type & 0xFFFFFFFF) != 10000:
                     sender = _sender_from_xml(text) or sender
 
-            display_text = format_message(text, local_type)
+            display_text, extra, kind = msg_parse.parse(text, local_type, resolve)
             if display_text is None:
                 continue
 
@@ -625,13 +569,15 @@ def iter_messages(chat, decrypted_dir, self_wxid, contacts, group_nicknames=None
                 "ts": create_time or 0,
                 "sender": sender_name,
                 "is_self": sender == self_wxid,
-                "kind": message_kind(local_type, text),
+                "kind": kind,
                 "text": display_text,
                 "local_type": local_type,
                 "local_id": local_id,
                 "server_id": server_id or None,
                 "create_time": create_time,
             }
+            if extra:
+                rec["extra"] = extra
             if with_packed_info and rec["kind"] == "image":
                 rec["packed_info_data"] = bytes(packed) if packed is not None else None
             records.append((create_time or 0, sort_seq or 0, rec))

@@ -214,6 +214,103 @@ class TestCsv(Base):
         self.assertEqual(rows[3][4], "")
 
 
+class TestRich(Base):
+    """Records with msg_parse "extra" (quote, link, forwarded chat bundle)."""
+
+    def setUp(self):
+        super().setUp()
+        evil_url = "javascript:alert(1)"
+        self.rich = [
+            rec(T0, "张三", "好的 [引用 李四: 明天<b>见</b>]", kind="quote"),
+            rec(T0 + 1, "张三", "[链接] 标题<i> (来源) https://example.com/a?x=1&y=(2)", kind="link"),
+            rec(T0 + 2, "张三", "[链接] 坏链接", kind="link"),
+            rec(T0 + 3, "我", "[聊天记录] 群聊的聊天记录 (2条)", is_self=True, kind="chat_history"),
+            rec(T0 + 4, "张三", "[拍一拍] 张三 拍了拍 我", kind="pat"),
+            rec(T0 + 5, "张三", "[转账] ¥1.00 已收款", kind="transfer"),
+        ]
+        self.rich[0]["extra"] = {"reply": "好的", "quote": {"sender": "李四<x>",
+                                                            "text": "明天<b>见</b>", "kind": "text"}}
+        self.rich[1]["extra"] = {"title": "标题<i>", "url": "https://example.com/a?x=1&y=(2)",
+                                 "desc": "描述\"><script>", "source": "来源"}
+        self.rich[2]["extra"] = {"title": "坏链接", "url": evil_url}
+        self.rich[3]["extra"] = {"title": "群聊的聊天记录", "items": [
+            {"sender": "A<script>", "time": "2023-6-20 19:45", "kind": "text", "text": "第一行\n第二行"},
+            {"sender": "B", "time": "2023-6-20 19:46", "kind": "chat_history",
+             "text": "[聊天记录] 内层", "items": [
+                 {"sender": "C", "time": "2023-6-20 10:00", "kind": "link", "text": "[链接] 文",
+                  "url": "https://example.com/in"}]},
+        ]}
+
+    def test_txt(self):
+        buf = io.StringIO()
+        F.write_txt(self.rich, self.group, buf)
+        lines = buf.getvalue().splitlines()
+        self.assertEqual(lines[0], "[2026-03-01 09:05:07] 张三: 好的 [引用 李四: 明天<b>见</b>]")
+        i = lines.index("[2026-03-01 09:05:10] 我: [聊天记录] 群聊的聊天记录 (2条)")
+        self.assertEqual(lines[i + 1:i + 5], [
+            "    [2023-6-20 19:45] A<script>: 第一行",
+            "      第二行",
+            "    [2023-6-20 19:46] B: [聊天记录] 内层",
+            "        [2023-6-20 10:00] C: [链接] 文",
+        ])
+        self.assertEqual(lines[i + 5], "[2026-03-01 09:05:11] 张三: [拍一拍] 张三 拍了拍 我")
+
+    def test_html(self):
+        p = self.out("r.html")
+        F.write(self.rich, self.group, p, "html")
+        s = self.read(p)
+        c = _Collector()
+        c.feed(s)
+        self.assertNotIn("script", c.tags)
+        self.assertNotIn("b", c.tags)
+        self.assertNotIn("i", c.tags)
+        self.assertNotIn("x", c.tags)
+        self.assertNotIn("javascript:", s)
+        self.assertIn('<div class="quote">李四&lt;x&gt;: 明天&lt;b&gt;见&lt;/b&gt;</div>', s)
+        self.assertIn('好的<div class="quote">', s)
+        self.assertIn('[链接] <a href="https://example.com/a?x=1&amp;y=(2)" target="_blank" '
+                      'rel="noopener noreferrer nofollow">标题&lt;i&gt;</a>', s)
+        self.assertIn("描述&quot;&gt;&lt;script&gt;", s)
+        self.assertIn(">[链接] 坏链接<", s)  # unsafe URL -> plain text
+        self.assertIn("<details><summary>[聊天记录] 群聊的聊天记录 (2条)</summary>", s)
+        self.assertIn('<span class="rs">A&lt;script&gt;</span>', s)
+        self.assertIn('<a href="https://example.com/in"', s)
+        self.assertEqual(s.count("<details>"), 2)  # nested bundle is collapsible too
+        self.assertIn('<div class="sys" title="2026-03-01 09:05:11">[拍一拍]', s)
+        self.assertIn('class="bubble k-transfer"', s)
+
+    def test_md(self):
+        p = self.out("r.md")
+        F.write(self.rich, self.group, p, "md")
+        s = self.read(p)
+        self.assertNotIn("<", s.replace("&lt;", ""))
+        self.assertIn("**张三** 09:05  好的\n\n> 李四&lt;x>: 明天&lt;b>见&lt;/b>\n", s)
+        self.assertIn("[链接] [标题&lt;i>](https://example.com/a?x=1&y=%282%29) (来源)", s)
+        self.assertIn("  [链接] 坏链接\n", s)
+        self.assertIn("> **A&lt;script>** 2023-6-20 19:45: 第一行  \n> 第二行  \n", s)
+        self.assertIn("> > **C** 2023-6-20 10:00: [\\[链接\\] 文](https://example.com/in)", s)
+
+    def test_json_and_csv(self):
+        p = self.out("r.json")
+        F.write(self.rich, self.group, p, "json")
+        d = json.loads(self.read(p))
+        self.assertEqual(d["messages"][3]["extra"]["items"][1]["items"][0]["url"],
+                         "https://example.com/in")
+        self.assertEqual(d["messages"][0]["extra"]["quote"]["sender"], "李四<x>")
+        p = self.out("r.csv")
+        F.write(self.rich, self.group, p, "csv")
+        with open(p, encoding="utf-8-sig", newline="") as f:
+            rows = list(csv.reader(f))
+        self.assertEqual(rows[1][4], "好的 [引用 李四: 明天<b>见</b>]")
+
+    def test_bad_extra_ignored(self):
+        recs = [rec(T0, "张三", "x", kind="quote"), rec(T0, "张三", "y", kind="link")]
+        recs[0]["extra"] = "not a dict"
+        recs[1]["extra"] = {"url": 5, "items": "nope"}
+        for fmt in F.FORMATS:
+            F.write(recs, self.group, self.out("bad." + fmt), fmt)
+
+
 class TestDispatch(Base):
     def test_formats_and_ext(self):
         self.assertEqual(set(F.FORMATS), {"txt", "md", "html", "json", "csv"})

@@ -90,7 +90,7 @@ MAX_LIMIT = 500          # hard cap for any list result
 MAX_CONTEXT = 100        # hard cap for before/after in get_message_context
 MAX_TEXT = 4000          # per-message text cap in results
 MAX_CANDIDATES = 20
-INDEX_VERSION = "1"
+INDEX_VERSION = "2"  # 2: rich message summaries (msg_parse)
 PLACEHOLDER_KINDS = ("image", "voice", "video", "emoji")
 # Databases the server reads; auto-refresh only re-decrypts these.
 _WANTED_DB_RE = re.compile(r"^(message/message_\d+\.db|message/message_resource\.db|contact/contact\.db)$")

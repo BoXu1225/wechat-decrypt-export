@@ -7,9 +7,15 @@ Every writer consumes the same record schema::
         "sender": str,          # display name
         "is_self": bool,
         "kind": str,            # text|image|voice|video|emoji|location|link|
-                                # file|miniprogram|quote|system|other
-        "text": str,            # display text, e.g. message body or "[图片]"
+                                # file|miniprogram|quote|system|call|card|
+                                # redpacket|transfer|chat_history|channels|
+                                # pat|music|notice|note|other
+        "text": str,            # one-line display text, e.g. message body,
+                                # "[图片]" or "[链接] 标题 (来源) https://..."
         "image_path": str|None, # optional path to a decoded image file
+        "extra": dict|None,     # optional structured details (msg_parse
+                                # schema); html/md/txt use "quote", "url",
+                                # "items" (forwarded chat bundle) for richer output
     }
 
 and chat metadata ``{"name": str, "is_group": bool}``.
@@ -64,15 +70,50 @@ def _img(rec):
     return rec.get("image_path") or None
 
 
+def _extra(rec):
+    e = rec.get("extra")
+    return e if isinstance(e, dict) else {}
+
+
+_SAFE_URL_RE = re.compile(r"(?i)^https?://[^\s\x00-\x1f\x7f]+$")
+
+
+def _safe_url(url):
+    """http(s) URL or None (no javascript:, data:, whitespace, ...)."""
+    return url if isinstance(url, str) and _SAFE_URL_RE.match(url) else None
+
+
+def _items(rec_or_item):
+    """Forwarded chat bundle items of a record (or nested item)."""
+    src = _extra(rec_or_item) if "extra" in rec_or_item else rec_or_item
+    items = src.get("items")
+    return items if isinstance(items, list) else []
+
+
+def _item_text(it):
+    return str(it.get("text") or "")
+
+
 # ---------------------------------------------------------------- txt
+
+def _txt_items(items, fp, depth):
+    pad = "    " * depth
+    for it in items:
+        text = _item_text(it).replace("\n", "\n" + pad + "  ")
+        fp.write(f"{pad}[{it.get('time') or ''}] {it.get('sender') or ''}: {text}\n")
+        _txt_items(_items(it), fp, depth + 1)
+
 
 def write_txt(records, meta, fp, base_dir=None, **_):
     """``[YYYY-MM-DD HH:MM:SS] sender: text`` one record per line (local time).
 
-    Byte-identical to the legacy export_chat.py output.
+    Identical to the legacy export_chat.py output, except that forwarded chat
+    bundles (extra.items) are followed by their messages as indented lines
+    (``    [time] sender: text``; nested bundles indent further).
     """
     for r in records:
         fp.write(f"[{_dt(r['ts']).strftime(TIME_FMT)}] {r['sender']}: {r['text']}\n")
+        _txt_items(_items(r), fp, 1)
 
 
 # ---------------------------------------------------------------- markdown
@@ -81,6 +122,56 @@ def _md_escape(s):
     """Neutralise raw HTML: many markdown viewers render inline HTML, so a
     message containing ``<script>``/``<img onerror=...>`` must not become a tag."""
     return (s or "").replace("<", "&lt;")
+
+
+def _md_link_text(s):
+    return _md_escape(s).replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+
+
+def _md_url(url):
+    return quote(url, safe=":/?#[]@!$&'*+,;=%~.-_")
+
+
+def _md_items(items, depth):
+    out = []
+    pre = "> " * depth
+    for it in items:
+        text = _md_escape(_item_text(it))
+        url = _safe_url(it.get("url"))
+        if url:
+            text = f"[{_md_link_text(_item_text(it))}]({_md_url(url)})"
+        text = text.replace("\n", "  \n" + pre)
+        out.append(f"{pre}**{_md_escape(it.get('sender'))}** {_md_escape(it.get('time'))}: {text}  ")
+        nested = _items(it)
+        if nested:
+            out.extend(_md_items(nested, depth + 1))
+    return out
+
+
+def _md_body(r):
+    """Markdown body for a non-image record, plus trailing block lines."""
+    e = _extra(r)
+    kind = r.get("kind")
+    text = r.get("text") or ""
+    after = []
+    q = e.get("quote")
+    if kind == "quote" and isinstance(q, dict):
+        text = e.get("reply") or ""
+        after.append(f"> {_md_escape(q.get('sender'))}: {_md_escape(q.get('text'))}"
+                      .replace("\n", " "))
+        body = _md_escape(text)
+    elif kind in ("link", "music") and _safe_url(e.get("url")):
+        label = "[音乐]" if kind == "music" else "[链接]"
+        title = e.get("title") or e.get("url")
+        body = f"{label} [{_md_link_text(title)}]({_md_url(e['url'])})"
+        if e.get("source"):
+            body += f" ({_md_escape(e['source'])})"
+    else:
+        body = _md_escape(text)
+    items = _items(r)
+    if items:
+        after.extend(_md_items(items, 1))
+    return body.replace("\n", "  \n"), after
 
 
 def write_markdown(records, meta, fp, base_dir=None, prev_date=None, header=True, **_):
@@ -99,14 +190,16 @@ def write_markdown(records, meta, fp, base_dir=None, prev_date=None, header=True
         if day != cur:
             fp.write(f"## {day}\n\n")
             cur = day
-        text = _md_escape(r.get("text"))
         img = _img(r)
+        after = []
         if img:
-            body = f"![{text}]({_rel_image(img, base_dir)})"
+            body = f"![{_md_escape(r.get('text'))}]({_rel_image(img, base_dir)})"
         else:
             # keep continuation lines inside the same paragraph
-            body = text.replace("\n", "  \n")
+            body, after = _md_body(r)
         fp.write(f"**{_md_escape(r['sender'])}** {dt.strftime('%H:%M')}  {body}\n\n")
+        if after:
+            fp.write("\n".join(after) + "\n\n")
 
 
 def _last_md_date(path):
@@ -139,7 +232,63 @@ main{max-width:760px;margin:0 auto;padding:8px 12px 32px}
 .bubble img{display:block;max-width:100%;max-height:360px;border-radius:6px}
 .time{font-size:11px;color:var(--muted);margin:2px 6px 0}
 .sys{text-align:center;color:var(--muted);font-size:12px;margin:8px 0;white-space:pre-wrap}
+.bubble a{color:inherit}
+.quote{margin-top:6px;padding:4px 8px;border-left:3px solid var(--muted);background:var(--sys);color:var(--muted);font-size:13px;border-radius:4px}
+.meta{color:var(--muted);font-size:12px;margin-top:4px}
+.bubble.k-redpacket,.bubble.k-transfer{background:#f79c42;color:#fff}
+details summary{cursor:pointer}
+.rec{margin-top:6px;padding-left:8px;border-left:2px solid var(--muted);font-size:13px}
+.ri{margin:4px 0}
+.ri .rs{font-weight:600}
+.ri .rt{color:var(--muted);font-size:11px}
 """
+
+
+def _html_items(items):
+    esc = html.escape
+    out = ['<div class="rec">']
+    for it in items:
+        url = _safe_url(it.get("url"))
+        text = esc(_item_text(it))
+        if url:
+            text = (f'<a href="{esc(url)}" target="_blank" '
+                    f'rel="noopener noreferrer nofollow">{text}</a>')
+        out.append(f'<div class="ri"><span class="rs">{esc(str(it.get("sender") or ""))}</span> '
+                   f'<span class="rt">{esc(str(it.get("time") or ""))}</span><div>{text}</div>')
+        nested = _items(it)
+        if nested:
+            out.append(f"<details><summary>{text}</summary>{_html_items(nested)}</details>")
+        out.append("</div>")
+    out.append("</div>")
+    return "".join(out)
+
+
+def _html_body(r):
+    """Inner HTML of a non-image bubble (every string escaped)."""
+    esc = html.escape
+    e = _extra(r)
+    kind = r.get("kind")
+    text = r.get("text") or ""
+    q = e.get("quote")
+    if kind == "quote" and isinstance(q, dict):
+        return (f"{esc(str(e.get('reply') or ''))}<div class=\"quote\">"
+                f"{esc(str(q.get('sender') or ''))}: {esc(str(q.get('text') or ''))}</div>")
+    url = _safe_url(e.get("url"))
+    if kind in ("link", "music") and url:
+        label = "[音乐] " if kind == "music" else "[链接] "
+        title = str(e.get("title") or url)
+        parts = [f'{label}<a href="{esc(url)}" target="_blank" '
+                 f'rel="noopener noreferrer nofollow">{esc(title)}</a>']
+        desc = str(e.get("desc") or e.get("artist") or "").strip()
+        if desc:
+            parts.append(f'<div class="meta">{esc(desc[:300])}</div>')
+        if e.get("source"):
+            parts.append(f'<div class="meta">{esc(str(e["source"]))}</div>')
+        return "".join(parts)
+    items = _items(r)
+    if items:
+        return f"<details><summary>{esc(text)}</summary>{_html_items(items)}</details>"
+    return esc(text)
 
 
 def write_html(records, meta, fp, base_dir=None, **_):
@@ -165,7 +314,7 @@ def write_html(records, meta, fp, base_dir=None, **_):
             cur = day
         text = r.get("text") or ""
         hm = dt.strftime("%H:%M")
-        if r.get("kind") == "system":
+        if r.get("kind") in ("system", "pat"):
             fp.write(f"<div class=\"sys\" title=\"{dt.strftime(TIME_FMT)}\">{esc(text)}</div>\n")
             continue
         self_ = bool(r.get("is_self"))
@@ -177,7 +326,8 @@ def write_html(records, meta, fp, base_dir=None, **_):
             parts.append(f"<div class=\"bubble img\"><img loading=\"lazy\" "
                          f"src=\"{esc(_rel_image(img, base_dir))}\" alt=\"{esc(text)}\"></div>")
         else:
-            parts.append(f"<div class=\"bubble\">{esc(text)}</div>")
+            kind = re.sub(r"[^a-z_]", "", str(r.get("kind") or ""))
+            parts.append(f"<div class=\"bubble k-{kind}\">{_html_body(r)}</div>")
         parts.append(f"<div class=\"time\" title=\"{dt.strftime(TIME_FMT)}\">{hm}</div></div>\n")
         fp.write("".join(parts))
     fp.write("</main>\n</body>\n</html>\n")
