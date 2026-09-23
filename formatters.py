@@ -77,14 +77,21 @@ def write_txt(records, meta, fp, base_dir=None, **_):
 
 # ---------------------------------------------------------------- markdown
 
+def _md_escape(s):
+    """Neutralise raw HTML: many markdown viewers render inline HTML, so a
+    message containing ``<script>``/``<img onerror=...>`` must not become a tag."""
+    return (s or "").replace("<", "&lt;")
+
+
 def write_markdown(records, meta, fp, base_dir=None, prev_date=None, header=True, **_):
     """Markdown with a ``## YYYY-MM-DD`` heading per day.
 
     ``prev_date`` (str) suppresses a heading for that day (used when
     appending). ``header`` writes a ``# name`` title; ignored if prev_date set.
+    ``<`` in names/senders/text is written as ``&lt;`` (no raw HTML).
     """
     if header and prev_date is None and meta.get("name"):
-        fp.write(f"# {meta['name']}\n\n")
+        fp.write(f"# {_md_escape(meta['name'])}\n\n")
     cur = prev_date
     for r in records:
         dt = _dt(r["ts"])
@@ -92,14 +99,14 @@ def write_markdown(records, meta, fp, base_dir=None, prev_date=None, header=True
         if day != cur:
             fp.write(f"## {day}\n\n")
             cur = day
-        text = r.get("text") or ""
+        text = _md_escape(r.get("text"))
         img = _img(r)
         if img:
             body = f"![{text}]({_rel_image(img, base_dir)})"
         else:
             # keep continuation lines inside the same paragraph
             body = text.replace("\n", "  \n")
-        fp.write(f"**{r['sender']}** {dt.strftime('%H:%M')}  {body}\n\n")
+        fp.write(f"**{_md_escape(r['sender'])}** {dt.strftime('%H:%M')}  {body}\n\n")
 
 
 def _last_md_date(path):

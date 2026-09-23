@@ -94,6 +94,16 @@ class TestMarkdown(Base):
         self.assertIn("![[图片]](images/a%20b%20%E5%9B%BE.jpg)", s)
         self.assertIn("**我** 00:00  [图片]\n", s)  # no image_path -> label only
 
+    def test_no_raw_html(self):
+        p = self.out("c.md")
+        records = self.records + [rec(T2 + 9, "<b>x</b>", "a < b")]
+        F.write(records, self.group, p, "md")
+        s = self.read(p)
+        self.assertNotIn("<", s)
+        self.assertIn("# 家庭群&lt;b>\n", s)
+        self.assertIn('&lt;script>alert("x")&lt;/script>&lt;img src=x onerror=alert(1)>', s)
+        self.assertIn("**&lt;b>x&lt;/b>** 00:00  a &lt; b\n", s)
+
     def test_append_does_not_repeat_heading(self):
         p = self.out("c.md")
         F.write(self.records[:2], self.group, p, "md")
