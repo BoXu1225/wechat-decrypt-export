@@ -423,14 +423,57 @@ class ChatsTest(unittest.TestCase):
         self.assertEqual(k(49, "<appmsg><type>33</type></appmsg>"), "miniprogram")
         self.assertEqual(k(49, "<appmsg><type>8</type></appmsg>"), "emoji")
         self.assertEqual(k(49 | (57 << 32), None), "quote")
-        self.assertEqual(k(49 | (2001 << 32), None), "other")
-        self.assertEqual(k(42, None), "other")
+        self.assertEqual(k(49 | (2001 << 32), None), "redpacket")
+        self.assertEqual(k(42, None), "card")
+        self.assertEqual(k(50, None), "call")
+        self.assertEqual(k(49 | (19 << 32), None), "chat_history")
+        self.assertEqual(k(49 | (999 << 32), None), "other")
+        self.assertEqual(k(12345, None), "other")
 
     def test_decompress(self):
         self.assertEqual(chats.decompress_if_needed(zstd("abc"), 4), "abc")
         self.assertEqual(chats.decompress_if_needed("plain", None), "plain")
         self.assertIsNone(chats.decompress_if_needed(b"garbage", 4))
         self.assertIsNone(chats.decompress_if_needed(b"bytes", None))
+
+
+class RichMessagesTest(unittest.TestCase):
+    """iter_messages resolves usernames inside XML and attaches "extra"."""
+
+    def test_group_quote_and_pat(self):
+        tmp = tempfile.mkdtemp(prefix="chats_rich_")
+        self.addCleanup(shutil.rmtree, tmp)
+        d = os.path.join(tmp, "decrypted")
+        fx = Fixture(d)
+        conn = sqlite3.connect(fx.dbs[0])
+        ids = {u: r for r, u in conn.execute("SELECT rowid, user_name FROM Name2Id")}
+        quote = (f"{DAVE}:\n<?xml version=\"1.0\"?>\n<msg><appmsg><title>re</title><type>57</type>"
+                 f"<refermsg><type>1</type><fromusr>{ROOM}</fromusr><chatusr>{BOB}</chatusr>"
+                 f"<displayname>bob xml</displayname><content>orig</content><svrid>77</svrid>"
+                 f"</refermsg></appmsg></msg>")
+        pat = (f"{BOB}:\n<msg><appmsg><title></title><type>62</type><patinfo>"
+               f"<fromusername>{BOB}</fromusername><pattedusername>{SELF}</pattedusername>"
+               f"<template><![CDATA[\"${{{BOB}}}\" 拍了拍 \"${{{SELF}}}\"]]></template>"
+               f"</patinfo></appmsg></msg>")
+        for ts, lt, sender, content in ((310, 49 | (57 << 32), DAVE, quote),
+                                        (311, 49 | (62 << 32), BOB, pat)):
+            conn.execute(f"INSERT INTO {tbl(ROOM)}(server_id, local_type, sort_seq, "
+                         f"real_sender_id, create_time, message_content) VALUES (?,?,?,?,?,?)",
+                         (ts, lt, ts * 1000, ids[sender], ts, content))
+        conn.commit()
+        conn.close()
+        contacts = chats.load_contacts(d)
+        room = {c["username"]: c for c in chats.list_chats(d, contacts=contacts)}[ROOM]
+        recs = [r for r in chats.iter_messages(room, d, SELF, contacts) if r["ts"] >= 310]
+        q, p = recs
+        self.assertEqual((q["sender"], q["kind"], q["text"]),
+                         ("Dave Stranger", "quote", "re [引用 Bob in group: orig]"))
+        self.assertEqual(q["extra"]["quote"]["sender"], "Bob in group")
+        self.assertEqual(q["extra"]["quote"]["server_id"], 77)
+        self.assertEqual((p["kind"], p["text"]), ("pat", '[拍一拍] "Bob in group" 拍了拍 "我"'))
+        # Plain records carry no "extra" key.
+        plain = next(chats.iter_messages(room, d, SELF, contacts))
+        self.assertNotIn("extra", plain)
 
 
 if __name__ == "__main__":
