@@ -547,6 +547,22 @@ def _sender_from_xml(text):
     return (m.group(1) or m.group(2) or "").strip() or None
 
 
+_VOICELEN_RE = re.compile(r'voicelength\s*=\s*"(\d+)"')
+_PLAYLEN_RE = re.compile(r'playlength\s*=\s*"(\d+)"')
+
+
+def media_duration(text, kind):
+    """Stated duration in seconds from voice (voicelength, ms) / video
+    (playlength, s) message XML, or None."""
+    if not text:
+        return None
+    if kind == "voice":
+        m = _VOICELEN_RE.search(text)
+        return int(m.group(1)) / 1000.0 if m else None
+    m = _PLAYLEN_RE.search(text)
+    return float(m.group(1)) if m else None
+
+
 def iter_messages(chat, decrypted_dir, self_wxid, contacts, group_nicknames=None,
                   with_packed_info=False):
     """Yield message records for a chat, sorted by time.
@@ -554,7 +570,9 @@ def iter_messages(chat, decrypted_dir, self_wxid, contacts, group_nicknames=None
     Record: {ts, sender, is_self, kind, text, local_type, local_id,
              server_id, create_time}
     with_packed_info=True adds "packed_info_data" (bytes or None) to image
-    records (kind "image"); it holds the image file md5 (see image_decode).
+    and video records; it holds the file md5 (see image_decode / media_decode).
+    It also adds "media_duration" (seconds, float) to voice records (XML
+    voicelength) and video records (XML playlength) when the XML has it.
     Messages whose formatted text is None are dropped.
     decrypted_dir is accepted for API symmetry (and group nicknames);
     table locations come from chat["tables"].
@@ -584,8 +602,9 @@ def iter_messages(chat, decrypted_dir, self_wxid, contacts, group_nicknames=None
         conn = sqlite3.connect(db_path)
         try:
             id2name = dict(conn.execute("SELECT rowid, user_name FROM Name2Id"))
-            # Only fetch the blob for image rows (cheap when not needed).
-            packed_col = ("CASE WHEN (local_type & 4294967295) = 3 THEN packed_info_data END"
+            # Only fetch the blob for image / video rows (cheap when not needed).
+            packed_col = ("CASE WHEN (local_type & 4294967295) IN (3, 43) "
+                          "THEN packed_info_data END"
                           if with_packed_info else "NULL")
             rows = conn.execute(f"""
                 SELECT local_id, server_id, local_type, real_sender_id, create_time,
@@ -632,8 +651,14 @@ def iter_messages(chat, decrypted_dir, self_wxid, contacts, group_nicknames=None
                 "server_id": server_id or None,
                 "create_time": create_time,
             }
-            if with_packed_info and rec["kind"] == "image":
-                rec["packed_info_data"] = bytes(packed) if packed is not None else None
+            if with_packed_info:
+                kind = rec["kind"]
+                if kind in ("image", "video"):
+                    rec["packed_info_data"] = bytes(packed) if packed is not None else None
+                if kind in ("voice", "video"):
+                    dur = media_duration(text, kind)
+                    if dur is not None:
+                        rec["media_duration"] = dur
             records.append((create_time or 0, sort_seq or 0, rec))
 
     # Stable sort keeps DB order (oldest DB first) for equal keys.

@@ -28,6 +28,7 @@ Tools (all read-only; results are compact JSON, times are local ISO strings):
     get_message_context(chat, message_id=None, time=None, before=10, after=10)
     get_contact(name)
     get_image(chat, message_id)
+    get_voice(chat, message_id)
     refresh(all_dbs=False)
 
 `chat` accepts a username, an exact name (remark/nickname/alias), or a
@@ -93,6 +94,8 @@ INDEX_VERSION = "1"
 PLACEHOLDER_KINDS = ("image", "voice", "video", "emoji")
 # Databases the server reads; auto-refresh only re-decrypts these.
 _WANTED_DB_RE = re.compile(r"^(message/message_\d+\.db|message/message_resource\.db|contact/contact\.db)$")
+# Voice blobs; large, so only refreshed on demand by get_voice.
+_MEDIA_DB_RE = re.compile(r"^message/media_\d+\.db$")
 
 
 class ToolError(Exception):
@@ -709,9 +712,8 @@ class WeChatData:
             self._image_keys = image_decode.get_image_keys(self.cfg)
         return self._image_keys
 
-    def get_image(self, chat, message_id):
-        """Returns (image_bytes, fmt, meta dict)."""
-        import image_decode as I
+    def _message_row(self, chat, message_id, cols):
+        """-> (chat dict, db number, local_id, row of cols) for a "N:local_id" id."""
         c = self.resolve_chat(chat)
         m = re.fullmatch(r"\s*(\d+):(\d+)\s*", str(message_id or ""))
         if not m:
@@ -723,12 +725,19 @@ class WeChatData:
             raise ToolError(f"message {message_id} not found in this chat")
         conn = sqlite3.connect(db_path)
         try:
-            row = conn.execute(f"SELECT local_type, create_time, packed_info_data FROM [{table}] "
-                               "WHERE local_id=?", (lid,)).fetchone()
+            row = conn.execute(f"SELECT {cols} FROM [{table}] WHERE local_id=?",
+                               (lid,)).fetchone()
         finally:
             conn.close()
         if not row:
             raise ToolError(f"message {message_id} not found in this chat")
+        return c, n, lid, row
+
+    def get_image(self, chat, message_id):
+        """Returns (image_bytes, fmt, meta dict)."""
+        import image_decode as I
+        c, n, lid, row = self._message_row(chat, message_id,
+                                           "local_type, create_time, packed_info_data")
         local_type, create_time, packed = row
         if (local_type & 0xFFFFFFFF) != 3:
             raise ToolError(f"message {message_id} is not an image (kind "
@@ -758,6 +767,38 @@ class WeChatData:
                 "variant": variant, "format": ext, "bytes": len(data)}
         return data, ext, meta
 
+    # -- voice --------------------------------------------------------------
+    def get_voice(self, chat, message_id):
+        """Returns (audio_bytes, fmt ("mp4" = AAC in .m4a, or "wav"), meta dict)."""
+        import media_decode as M
+        c, n, lid, row = self._message_row(
+            chat, message_id,
+            "local_type, create_time, server_id, message_content, WCDB_CT_message_content")
+        local_type, create_time, server_id, content, ct = row
+        if (local_type & 0xFFFFFFFF) != 34:
+            raise ToolError(f"message {message_id} is not a voice message (kind "
+                            f"{C.message_kind(local_type, None)})")
+        with contextlib.suppress(ToolError):
+            self.refresh(only=_MEDIA_DB_RE)  # voice blobs live in media_N.db
+        with M.VoiceStore(self.decrypted_dir) as store:
+            blob = store.get(c["username"], server_id, create_time, lid)
+        if blob is None:
+            raise ToolError("voice data not found (not downloaded in WeChat, or "
+                            "message/media_*.db not decrypted yet)")
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                path, secs = M.voice_to_file(blob, os.path.join(td, "voice"))
+            except M.MediaDecodeError as e:
+                raise ToolError(f"could not decode voice: {e}")
+            with open(path, "rb") as f:
+                data = f.read()
+        stated = C.media_duration(C.decompress_if_needed(content, ct), "voice")
+        fmt = "mp4" if path.endswith(".m4a") else "wav"
+        meta = {"chat": c["name"], "id": f"{n}:{lid}", "time": iso(create_time),
+                "duration": M.seconds(stated if stated is not None else secs),
+                "format": "m4a" if fmt == "mp4" else "wav", "bytes": len(data)}
+        return data, fmt, meta
+
     # -- refresh ------------------------------------------------------------
     def _load_decryptor(self):
         if self._decryptor is None:
@@ -766,8 +807,9 @@ class WeChatData:
             self._decryptor = decrypt_db
         return self._decryptor
 
-    def refresh(self, all_dbs=False):
-        """Re-decrypt changed databases with existing keys. Never runs sudo."""
+    def refresh(self, all_dbs=False, only=None):
+        """Re-decrypt changed databases with existing keys. Never runs sudo.
+        only: regex of relative DB paths to limit the work to (overrides all_dbs)."""
         t0 = time.time()
         db_dir = self.cfg.get("db_dir")
         if not db_dir or not os.path.isdir(db_dir):
@@ -787,7 +829,10 @@ class WeChatData:
                     continue
                 src = os.path.join(root, fn)
                 rel = os.path.relpath(src, db_dir).replace("\\", "/")
-                if not all_dbs and not _WANTED_DB_RE.match(rel):
+                if only is not None:
+                    if not only.match(rel):
+                        continue
+                elif not all_dbs and not _WANTED_DB_RE.match(rel):
                     continue
                 out = os.path.join(self.decrypted_dir, rel)
                 if dd.is_current(state, rel, src, out):  # neither .db nor -wal changed
@@ -815,8 +860,9 @@ class WeChatData:
                 finally:
                     with contextlib.suppress(FileNotFoundError):
                         os.remove(tmp)
-        self._last_refresh = time.time()
-        if updated:
+        if only is None:
+            self._last_refresh = time.time()
+        if updated and only is None:
             self.invalidate()
         res = {"updated": sorted(updated), "unchanged": unchanged, "failed": sorted(failed),
                "missing_keys": sorted(missing), "stale_keys": sorted(stale),
@@ -941,6 +987,13 @@ def build_server(data, log, lifespan=None):
         from mcp.server.mcpserver import MCPServer as Server, Image
     except ImportError:  # mcp 1.x
         from mcp.server.fastmcp import FastMCP as Server, Image
+    try:
+        from mcp.server.mcpserver import Audio
+    except ImportError:
+        try:
+            from mcp.server.fastmcp import Audio
+        except ImportError:
+            Audio = None
     from mcp.types import ToolAnnotations
     from typing import Literal, Optional
 
@@ -1007,6 +1060,19 @@ def build_server(data, log, lifespan=None):
         if isinstance(res, tuple):
             img, ext, meta = res
             return [Image(data=img, format={"jpg": "jpeg"}.get(ext, ext)), dumps(meta)]
+        return dumps(res)
+
+    @srv.tool(annotations=ro, structured_output=False)
+    def get_voice(chat: str, message_id: str):
+        """Decode and return the audio of a voice message (kind "voice") as AAC/m4a,
+        plus its duration in seconds. No transcript."""
+        a = dict(chat=chat, message_id=message_id)
+        res = call_tool(data, log, "get_voice", a, lambda: data.get_voice(**a))
+        if isinstance(res, tuple):
+            audio, fmt, meta = res
+            if Audio is None:  # SDK without audio content support
+                return dumps(dict(meta, error="this MCP SDK cannot return audio"))
+            return [Audio(data=audio, format=fmt), dumps(meta)]
         return dumps(res)
 
     @srv.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False,

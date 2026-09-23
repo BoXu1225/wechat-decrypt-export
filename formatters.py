@@ -10,13 +10,21 @@ Every writer consumes the same record schema::
                                 # file|miniprogram|quote|system|other
         "text": str,            # display text, e.g. message body or "[图片]"
         "image_path": str|None, # optional path to a decoded image file
+        "audio_path": str|None, # optional voice file (m4a/wav)
+        "video_path": str|None, # optional video file (mp4)
+        "poster_path": str|None,# optional video thumbnail
+        "duration": int|None,   # optional voice/video length in whole seconds
     }
 
 and chat metadata ``{"name": str, "is_group": bool}``.
 
 Writers have the signature ``writer(records, meta, fp, base_dir=None, **kw)``
 where ``fp`` is an open text file and ``base_dir`` is the directory the output
-file lives in (image paths are written relative to it; defaults to cwd).
+file lives in (media paths are written relative to it; defaults to cwd).
+
+Voice / video records with a ``duration`` are labelled ``[语音 12″]`` /
+``[视频 0:35]`` in txt/csv (and wherever there is no playable file); records
+without it keep their plain ``text``, so output without media is unchanged.
 
 Incremental export
 ------------------
@@ -64,6 +72,28 @@ def _img(rec):
     return rec.get("image_path") or None
 
 
+def fmt_duration(kind, sec):
+    """12 -> '12″' for voice; 35 -> '0:35' (1:02:03 past an hour) for video."""
+    sec = int(sec)
+    if kind == "voice":
+        return f"{sec}\u2033"
+    h, rest = divmod(sec, 3600)
+    m, s = divmod(rest, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def label(rec):
+    """Display text: ``[语音 12″]`` / ``[视频 0:35]`` when the record has a
+    duration, else the record's text."""
+    kind, dur = rec.get("kind"), rec.get("duration")
+    if dur is not None and kind in ("voice", "video"):
+        return f"[{'语音' if kind == 'voice' else '视频'} {fmt_duration(kind, dur)}]"
+    return rec.get("text") or ""
+
+
+_MEDIA_KEYS = ("image_path", "audio_path", "video_path", "poster_path")
+
+
 # ---------------------------------------------------------------- txt
 
 def write_txt(records, meta, fp, base_dir=None, **_):
@@ -72,7 +102,7 @@ def write_txt(records, meta, fp, base_dir=None, **_):
     Byte-identical to the legacy export_chat.py output.
     """
     for r in records:
-        fp.write(f"[{_dt(r['ts']).strftime(TIME_FMT)}] {r['sender']}: {r['text']}\n")
+        fp.write(f"[{_dt(r['ts']).strftime(TIME_FMT)}] {r['sender']}: {label(r)}\n")
 
 
 # ---------------------------------------------------------------- markdown
@@ -99,10 +129,20 @@ def write_markdown(records, meta, fp, base_dir=None, prev_date=None, header=True
         if day != cur:
             fp.write(f"## {day}\n\n")
             cur = day
-        text = _md_escape(r.get("text"))
+        text = _md_escape(label(r))
         img = _img(r)
+        audio, video, poster = r.get("audio_path"), r.get("video_path"), r.get("poster_path")
         if img:
             body = f"![{text}]({_rel_image(img, base_dir)})"
+        elif audio or video:
+            link = _rel_image(audio or video, base_dir)
+            desc = f"▶ {text[1:-1]}" if text.startswith("[") and text.endswith("]") else text
+            if video and poster:
+                body = f"[![{desc}]({_rel_image(poster, base_dir)})]({link})"
+            else:
+                body = f"[{desc}]({link})"
+        elif poster:
+            body = f"![{text}]({_rel_image(poster, base_dir)})"
         else:
             # keep continuation lines inside the same paragraph
             body = text.replace("\n", "  \n")
@@ -136,7 +176,12 @@ main{max-width:760px;margin:0 auto;padding:8px 12px 32px}
 .bubble{max-width:min(78%,560px);background:var(--other);padding:8px 11px;border-radius:8px;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}
 .self .bubble{background:var(--self);color:var(--selffg)}
 .bubble.img{padding:3px;background:transparent}
-.bubble img{display:block;max-width:100%;max-height:360px;border-radius:6px}
+.bubble img,.bubble video{display:block;max-width:100%;max-height:360px;border-radius:6px}
+.bubble.voice{display:flex;align-items:center;gap:8px;padding:5px 8px}
+.bubble audio{height:36px;max-width:260px}
+.dur{font-size:12px;color:var(--muted);white-space:nowrap}
+.self .dur{color:inherit;opacity:.7}
+.bubble.img .dur{margin:2px 4px 0}
 .time{font-size:11px;color:var(--muted);margin:2px 6px 0}
 .sys{text-align:center;color:var(--muted);font-size:12px;margin:8px 0;white-space:pre-wrap}
 """
@@ -163,7 +208,7 @@ def write_html(records, meta, fp, base_dir=None, **_):
         if day != cur:
             fp.write(f"<div class=\"day\"><span>{day}</span></div>\n")
             cur = day
-        text = r.get("text") or ""
+        text = label(r)
         hm = dt.strftime("%H:%M")
         if r.get("kind") == "system":
             fp.write(f"<div class=\"sys\" title=\"{dt.strftime(TIME_FMT)}\">{esc(text)}</div>\n")
@@ -173,9 +218,26 @@ def write_html(records, meta, fp, base_dir=None, **_):
         if group and not self_:
             parts.append(f"<div class=\"name\">{esc(r.get('sender') or '')}</div>")
         img = _img(r)
+        audio, video, poster = r.get("audio_path"), r.get("video_path"), r.get("poster_path")
+        dur = r.get("duration")
+        dur_html = (f"<span class=\"dur\">{esc(fmt_duration(r.get('kind'), dur))}</span>"
+                    if dur is not None and r.get("kind") in ("voice", "video") else "")
         if img:
             parts.append(f"<div class=\"bubble img\"><img loading=\"lazy\" "
                          f"src=\"{esc(_rel_image(img, base_dir))}\" alt=\"{esc(text)}\"></div>")
+        elif audio:
+            parts.append(f"<div class=\"bubble voice\"><audio controls preload=\"none\" "
+                         f"src=\"{esc(_rel_image(audio, base_dir))}\" title=\"{esc(text)}\">"
+                         f"</audio>{dur_html}</div>")
+        elif video:
+            poster_attr = (f" poster=\"{esc(_rel_image(poster, base_dir))}\"" if poster else "")
+            parts.append(f"<div class=\"bubble img\"><video controls preload=\"none\"{poster_attr} "
+                         f"src=\"{esc(_rel_image(video, base_dir))}\" title=\"{esc(text)}\">"
+                         f"</video>{dur_html}</div>")
+        elif poster:  # video file not downloaded: show its thumbnail
+            parts.append(f"<div class=\"bubble img\"><img loading=\"lazy\" "
+                         f"src=\"{esc(_rel_image(poster, base_dir))}\" alt=\"{esc(text)}\">"
+                         f"<span class=\"dur\">{esc(text)}</span></div>")
         else:
             parts.append(f"<div class=\"bubble\">{esc(text)}</div>")
         parts.append(f"<div class=\"time\" title=\"{dt.strftime(TIME_FMT)}\">{hm}</div></div>\n")
@@ -189,16 +251,16 @@ def write_json(records, meta, fp, base_dir=None, **_):
     """``{"chat": meta, "messages": [record + "time" ISO string]}``.
 
     Not appendable: load, extend ``messages`` and re-render instead.
-    image_path is rewritten relative to base_dir.
+    image/audio/video/poster paths are rewritten relative to base_dir.
     """
     msgs = []
     for r in records:
         m = dict(r)
         m["time"] = _dt(r["ts"]).isoformat()
-        if _img(r):
-            rel = os.path.relpath(os.path.abspath(r["image_path"]),
-                                  os.path.abspath(base_dir or "."))
-            m["image_path"] = rel.replace(os.sep, "/")
+        for k in _MEDIA_KEYS:
+            if r.get(k):
+                rel = os.path.relpath(os.path.abspath(r[k]), os.path.abspath(base_dir or "."))
+                m[k] = rel.replace(os.sep, "/")
         msgs.append(m)
     json.dump({"chat": dict(meta), "messages": msgs}, fp, ensure_ascii=False, indent=2)
     fp.write("\n")
@@ -221,7 +283,7 @@ def write_csv(records, meta, fp, base_dir=None, header=True, **_):
     for r in records:
         w.writerow([_dt(r["ts"]).strftime(TIME_FMT), r.get("sender", ""),
                     "1" if r.get("is_self") else "0", r.get("kind", ""),
-                    r.get("text") or ""])
+                    label(r)])
 
 
 # ---------------------------------------------------------------- dispatch
