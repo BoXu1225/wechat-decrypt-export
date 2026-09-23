@@ -111,6 +111,10 @@ copy_and_sign() {
         warn "${WECHAT_DST} 中的微信正在运行，请先退出微信，再重新运行 ./setup.sh"
         return 1
     fi
+    if [[ ! -d "${WECHAT_SRC}" ]]; then
+        warn "未找到 ${WECHAT_SRC}，不会删除现有副本"
+        return 1
+    fi
     if [[ -e "${WECHAT_DST}" ]]; then
         ok "删除旧的副本 ${WECHAT_DST} ..."
         rm -rf "${WECHAT_DST}"
