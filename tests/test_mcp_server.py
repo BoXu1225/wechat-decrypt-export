@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 import mcp_server as M  # noqa: E402
 from test_chats import (ALICE, BOB, DAVE, IMAGE_MD5, ROOM, SELF, Fixture,  # noqa: E402
                         tbl)
+from test_media import HAVE_SILK, make_media_db, silk_sample  # noqa: E402
 
 
 def make_data(root, **cfg_extra):
@@ -400,7 +401,7 @@ class DispatchTest(Base):
                 tools = {t.name for t in (await client.list_tools()).tools}
                 self.assertEqual(tools, {"list_chats", "get_messages", "search_messages",
                                          "get_message_context", "get_contact", "get_image",
-                                         "refresh"})
+                                         "get_voice", "refresh"})
                 r = await client.call_tool("list_chats", {"type": "single"})
                 payload = json.loads(r.content[0].text)
                 self.assertEqual(payload["chats"][0]["username"], ALICE)
@@ -412,7 +413,40 @@ class DispatchTest(Base):
                 self.assertEqual(json.loads(r.content[1].text)["variant"], "full")
                 r = await client.call_tool("get_image", {"chat": ALICE, "message_id": "0:1"})
                 self.assertIn("not an image", json.loads(r.content[0].text)["error"])
+                if voice_id:
+                    r = await client.call_tool("get_voice", {"chat": ALICE,
+                                                             "message_id": voice_id})
+                    self.assertEqual(r.content[0].type, "audio")
+                    self.assertIn(r.content[0].mime_type, ("audio/mp4", "audio/wav"))
+                    self.assertEqual(json.loads(r.content[1].text)["duration"], 3)
+        voice_id = _add_voice(self.fx, self.tmp) if HAVE_SILK else None
         anyio.run(go)
+
+
+def _add_voice(fx, root, ts=260, voicelength=2600):
+    """Voice message in ALICE's chat + its SILK blob in media_0.db -> message id."""
+    lid = add_msg(fx.dbs[0], ALICE, 34, ALICE, ts,
+                  f'<msg><voicemsg voicelength="{voicelength}" /></msg>')
+    make_media_db(os.path.join(root, "decrypted", "message", "media_0.db"),
+                  [(ALICE, ts, lid, ts, silk_sample(2.0))])
+    return f"0:{lid}"
+
+
+class VoiceTest(Base):
+    @unittest.skipUnless(HAVE_SILK, "silk-python not installed")
+    def test_get_voice(self):
+        vid = _add_voice(self.fx, self.tmp)
+        data, fmt, meta = self.data.get_voice(ALICE, vid)
+        self.assertEqual(meta["duration"], 3)  # stated voicelength 2.6 s
+        self.assertEqual(meta["id"], vid)
+        self.assertEqual(meta["bytes"], len(data))
+        if fmt == "mp4":
+            self.assertEqual(data[4:8], b"ftyp")
+        else:
+            self.assertEqual(data[:4], b"RIFF")
+        self.assertIn("not a voice", self.err(self.data.get_voice, ALICE, "0:1")["error"])
+        vid2 = add_msg(self.fx.dbs[0], ALICE, 34, ALICE, 270, "<msg><voicemsg /></msg>")
+        self.assertIn("not found", self.err(self.data.get_voice, ALICE, f"0:{vid2}")["error"])
 
 
 class FakeDecryptor(types.SimpleNamespace):

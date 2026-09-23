@@ -10,6 +10,7 @@
     python export_chat.py --list [过滤词] [--type group] # 列出聊天（名称、类型、消息数、最后日期）
     python export_chat.py --all [--type single]         # 增量导出全部聊天
     python export_chat.py <联系人> --since 2024-01-01 --until 2024-12-31
+    python export_chat.py <联系人> -f html --media      # 图片 + 可播放的语音 / 视频
 
 依赖:
     - 已解密的微信数据库 (decrypt_db.py)
@@ -46,7 +47,7 @@ _TIME_FMT = formatters.TIME_FMT
 # Markdown 增量状态（写在文件末尾的 HTML 注释，渲染时不可见；消息中的 "<" 已转义，无法伪造）
 _MD_STATE_RE = re.compile(r"^<!-- wechat-export: last=(\d+) n=(\d+) -->\s*$")
 # 记录中不写入输出文件的内部字段
-_INTERNAL_KEYS = ("packed_info_data",)
+_INTERNAL_KEYS = ("packed_info_data", "media_duration")
 
 
 @functools.lru_cache(maxsize=None)
@@ -428,14 +429,155 @@ class ImageExporter:
 
 
 # ---------------------------------------------------------------------------
+# 语音 / 视频
+# ---------------------------------------------------------------------------
+
+class MediaExporter:
+    """语音转换为 <名称>_files/<server_id>.m4a，视频复制为 <md5>.mp4（封面 <md5>_thumb.jpg），
+    并设置 record 的 audio_path / video_path / poster_path / duration（消息 XML 中的时长，
+    没有时取文件时长）。
+
+    已存在的文件直接复用（增量友好）。voice / video=False 时该类型只引用已有文件。"""
+
+    def __init__(self, cfg, voice=True, video=True):
+        self.cfg = cfg or {}
+        self.voice, self.video = voice, video
+        self.base_dir = self.cfg.get("wechat_base_dir") or ""
+        self.decrypted_dir = self.cfg.get("decrypted_dir") or ""
+        self.v_new = self.v_existing = self.v_missing = self.v_failed = 0
+        self.m_new = self.m_existing = self.m_poster = self.m_missing = 0
+        self.seconds = 0.0
+
+    @classmethod
+    def attach_existing(cls, records, files_dir):
+        """只引用已导出的语音 / 视频（未指定 --media / --voice 时保留之前的引用）。"""
+        cls(None, voice=False, video=False).attach(None, records, files_dir)
+
+    def attach(self, chat, records, files_dir):
+        import time as _time
+        import media_decode as M
+        t0 = _time.time()
+        jobs = []
+        for r in records:
+            kind = r.get("kind")
+            dur = r.get("media_duration")
+            if kind in ("voice", "video") and dur is not None:
+                r["duration"] = M.seconds(dur)  # stated length from the message XML
+            if kind == "voice":
+                stem = os.path.join(files_dir, M.voice_stem(
+                    r.get("server_id"), r.get("create_time"), r.get("local_id")))
+                path = M.existing_audio(stem)
+                if path:
+                    r["audio_path"] = path
+                    if dur is None:
+                        r["duration"] = M.seconds(M.audio_file_duration(path))
+                    self.v_existing += self.voice
+                elif self.voice:
+                    jobs.append((r, stem))
+            elif kind == "video":
+                self._attach_video(M, r, files_dir, dur)
+        if jobs:
+            self._convert_voices(M, chat, jobs)
+        if self.voice or self.video:
+            self.seconds += _time.time() - t0
+
+    def _attach_video(self, M, r, files_dir, dur):
+        md5 = M.md5_from_packed_info(r.get("packed_info_data"))
+        if not md5:
+            self.m_missing += self.video
+            return
+        mp4 = os.path.join(files_dir, f"{md5}.mp4")
+        thumb = os.path.join(files_dir, f"{md5}_thumb.jpg")
+        have_mp4, have_thumb = os.path.exists(mp4), os.path.exists(thumb)
+        if self.video and have_mp4:
+            self.m_existing += 1
+        elif self.video:
+            src, src_thumb = M.find_video_for_message(self.base_dir, md5=md5,
+                                                      create_time=r.get("create_time"))
+            if src_thumb and not have_thumb:
+                have_thumb = _try_copy(M, src_thumb, thumb)
+            if src and _try_copy(M, src, mp4):
+                have_mp4 = True
+                self.m_new += 1
+            elif have_thumb:
+                self.m_poster += 1
+            else:
+                self.m_missing += 1
+        if have_thumb:
+            r["poster_path"] = thumb
+        if have_mp4:
+            r["video_path"] = mp4
+            if dur is None:
+                r["duration"] = M.seconds(M.mp4_duration(mp4))
+
+    def _convert_voices(self, M, chat, jobs):
+        from concurrent.futures import ThreadPoolExecutor
+        todo = []
+        with M.VoiceStore(self.decrypted_dir) as store:
+            for r, stem in jobs:
+                data = store.get(chat["username"], r.get("server_id"), r.get("create_time"),
+                                 r.get("local_id"))
+                if data is None:
+                    self.v_missing += 1
+                else:
+                    todo.append((r, stem, data))
+        if not todo:
+            return
+        os.makedirs(os.path.dirname(todo[0][1]), exist_ok=True)
+
+        def convert(job):
+            r, stem, data = job
+            try:
+                return r, M.voice_to_file(data, stem)
+            except (M.MediaDecodeError, OSError):
+                return r, None
+
+        with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 2)) as pool:
+            for r, res in pool.map(convert, todo):
+                if res is None:
+                    self.v_failed += 1
+                    continue
+                path, dur = res
+                r["audio_path"] = path
+                r.setdefault("duration", M.seconds(dur))
+                self.v_new += 1
+
+    def summary(self):
+        if self.voice and (self.v_new + self.v_existing + self.v_missing + self.v_failed):
+            print(f"[+] 语音: 新转换 {self.v_new}，已存在 {self.v_existing}，"
+                  f"缺失 {self.v_missing}，转换失败 {self.v_failed}")
+            if self.v_new and not _has_afconvert():
+                print("[!] 未找到 afconvert，语音保存为 WAV")
+        if self.video and (self.m_new + self.m_existing + self.m_poster + self.m_missing):
+            print(f"[+] 视频: 新复制 {self.m_new}，已存在 {self.m_existing}，"
+                  f"仅封面 {self.m_poster}（视频未下载），缺失 {self.m_missing}")
+        if self.v_new or self.m_new:
+            print(f"[+] 语音/视频处理用时 {self.seconds:.1f} 秒")
+
+
+def _try_copy(M, src, dst):
+    try:
+        M.copy_file(src, dst)
+        return True
+    except OSError:
+        return False
+
+
+def _has_afconvert():
+    import media_decode
+    return media_decode.afconvert_path() is not None
+
+
+# ---------------------------------------------------------------------------
 # 导出
 # ---------------------------------------------------------------------------
 
 def export_one(src, chat, fmt="txt", output_file=None, incremental=False, since=None,
-               until=None, export_dir=None, quiet=False, images=None):
+               until=None, export_dir=None, quiet=False, images=None, media=None):
     """导出一个聊天。返回写入（新增）的消息条数；html/json 增量模式下为新增条数。
 
-    images: ImageExporter 实例时解码图片到 <名称>_files/ 并在 md/html/json 中引用。"""
+    images: ImageExporter 实例时解码图片到 <名称>_files/ 并在 md/html/json 中引用。
+    media: MediaExporter 实例时导出语音 / 视频到 <名称>_files/。"""
     log = (lambda *a: None) if quiet else print
     export_dir = export_dir or DEFAULT_EXPORT_DIR
     fname = chat_filename(chat, src.contacts)
@@ -444,17 +586,23 @@ def export_one(src, chat, fmt="txt", output_file=None, incremental=False, since=
     files_dir = os.path.join(os.path.dirname(os.path.abspath(path)), f"{fname}_files")
     meta = {"name": chat["name"], "is_group": chat["is_group"]}
 
-    reuse_images = images is None and fmt in ("md", "html", "json") and os.path.isdir(files_dir)
+    embeds = fmt in ("md", "html", "json") and os.path.isdir(files_dir)
+    reuse_images = images is None and embeds
+    reuse_media = media is None and embeds
 
     def with_images(recs):
         if images is not None:
             images.attach(chat, recs, files_dir)
         elif reuse_images:
             ImageExporter.attach_existing(recs, files_dir)
+        if media is not None:
+            media.attach(chat, recs, files_dir)
+        elif reuse_media:
+            MediaExporter.attach_existing(recs, files_dir)
         return _clean(recs)
 
     records = src.messages(chat, since, until,
-                           with_packed_info=images is not None or reuse_images)
+                           with_packed_info=bool(images or media or reuse_images or reuse_media))
 
     if not incremental:
         if not records:
@@ -618,7 +766,8 @@ def cmd_list(src, pattern, chat_type="all"):
     print(f"[+] 共 {len(chats)} 个聊天（单聊 {len(chats) - n_group}，群聊 {n_group}）")
 
 
-def cmd_all(src, pattern, export_dir, since, until, fmt="txt", chat_type="all", images=None):
+def cmd_all(src, pattern, export_dir, since, until, fmt="txt", chat_type="all", images=None,
+            media=None):
     chats = filter_chats(src.chats(), pattern, chat_type)
     if not chats:
         print(f"[!] 没有找到{_type_desc(chat_type)}记录")
@@ -629,7 +778,7 @@ def cmd_all(src, pattern, export_dir, since, until, fmt="txt", chat_type="all", 
     total_new = changed = 0
     for i, c in enumerate(chats, 1):
         n = export_one(src, c, fmt, None, incremental=True, since=since, until=until,
-                       export_dir=export_dir, quiet=True, images=images)
+                       export_dir=export_dir, quiet=True, images=images, media=media)
         if n:
             changed += 1
             total_new += n
@@ -658,6 +807,11 @@ def build_parser():
                         help="聊天类型过滤: all / single（单聊）/ group（群聊），默认 all")
     parser.add_argument("--images", action="store_true",
                         help="解码图片到 export/<名称>_files/，md/html/json 中直接引用（txt/csv 仍显示 [图片]）")
+    parser.add_argument("--voice", action="store_true",
+                        help="把语音转换为 m4a 保存到 export/<名称>_files/，md/html/json 中可直接播放"
+                             "（txt/csv 显示 [语音 12″]）")
+    parser.add_argument("--media", action="store_true",
+                        help="导出图片、语音和视频（= --images --voice + 复制已下载的视频及封面）")
     parser.add_argument("--since", type=_parse_date, metavar="YYYY-MM-DD",
                         help="只导出该日期（含）之后的消息")
     parser.add_argument("--until", type=_parse_date, metavar="YYYY-MM-DD",
@@ -695,17 +849,25 @@ def main(argv=None):
         print(f"[!] 未找到消息数据库目录: {os.path.join(decrypted_dir, 'message')}")
         return 1
     src = ChatSource(decrypted_dir, cfg["self_wxid"])
-    images = ImageExporter(cfg) if args.images else None
-    if images is not None and args.format in ("txt", "csv") and args.list_filter is None:
-        print(f"[!] {args.format} 格式不嵌入图片，图片只保存到 <名称>_files/ 目录")
+    images = ImageExporter(cfg) if args.images or args.media else None
+    media = (MediaExporter(dict(cfg, decrypted_dir=decrypted_dir), voice=True, video=args.media)
+             if args.voice or args.media else None)
+    if (images or media) is not None and args.format in ("txt", "csv") \
+            and args.list_filter is None:
+        what = "图片/语音/视频" if media is not None and images is not None else \
+            "图片" if images is not None else "语音"
+        print(f"[!] {args.format} 格式不嵌入{what}，文件只保存到 <名称>_files/ 目录")
 
     if args.list_filter is not None:
         cmd_list(src, args.list_filter or args.contact, args.chat_type)
         return 0
     if args.all:
-        cmd_all(src, args.contact, export_dir, since, until, args.format, args.chat_type, images)
+        cmd_all(src, args.contact, export_dir, since, until, args.format, args.chat_type, images,
+                media)
         if images is not None:
             images.summary()
+        if media is not None:
+            media.summary()
         return 0
 
     chat = resolve_chat(src, args.contact, args.chat_type)
@@ -714,9 +876,11 @@ def main(argv=None):
     print(f"[+] 目标: {chat_label(chat)}（{chat['username']}）")
     print(f"[+] 聊天记录分布在 {len(chat['tables'])} 个数据库中（共 {chat['msg_count']} 条原始记录）")
     export_one(src, chat, args.format, args.output, args.incremental, since, until, export_dir,
-               images=images)
+               images=images, media=media)
     if images is not None:
         images.summary()
+    if media is not None:
+        media.summary()
     return 0
 
 

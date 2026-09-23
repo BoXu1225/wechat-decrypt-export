@@ -4,7 +4,7 @@
 
 [English](README_EN.md)
 
-我们的数据，我们做主！解密微信 4.x (macOS) 本地 SQLCipher 4 加密数据库，把单聊和群聊导出为 txt、Markdown、HTML、JSON 或 CSV，支持图片。
+我们的数据，我们做主！解密微信 4.x (macOS) 本地 SQLCipher 4 加密数据库，把单聊和群聊导出为 txt、Markdown、HTML、JSON 或 CSV，支持图片、可播放的语音和视频。
 
 ## 安装
 
@@ -38,6 +38,7 @@
 
 ```bash
 ./wechat ning -f html --images           # 带图片的聊天气泡风格 HTML
+./wechat ning -f html --media            # 再加上可直接播放的语音和视频
 ./wechat ning -i                         # 增量：新消息追加到 export/<名称>.txt
 ./wechat ning --since 2026-01-01 --until 2026-06-30
 ./wechat --all --type group -f md        # 所有群聊导出为 Markdown
@@ -53,6 +54,8 @@
 | `--list [过滤词]` | 列出聊天 |
 | `--type` | `all`（默认）、`single`（单聊）、`group`（群聊） |
 | `--images` | 解码图片到 `export/<名称>_files/`，在 md/html/json 中直接显示（txt/csv 仍显示 `[图片]`） |
+| `--voice` | 把语音转换为 `export/<名称>_files/<id>.m4a`，html 中可直接播放（`<audio>`），md/json 中为链接；txt/csv 显示 `[语音 12″]` |
+| `--media` | `--images` + `--voice` + 复制已下载的视频（`<md5>.mp4`，封面 `<md5>_thumb.jpg`），html 中用 `<video>` 播放；txt/csv 显示 `[视频 0:35]` |
 | `--since` / `--until` | 日期范围 `YYYY-MM-DD`，包含当天 |
 | `-o`, `--output` | 输出文件（默认 `export/<名称>_chat.<扩展名>`） |
 | `--export-dir` | 导出目录（默认 `export/`） |
@@ -64,6 +67,7 @@
 - **跨数据库的聊天**（`message_0.db`、`message_1.db`……大约每年一个）
 - **消息类型**：文字、图片、语音、视频、表情、链接、文件、引用、小程序、系统消息；自动解压 zstd 压缩的消息
 - **图片**：解码微信 4.x 加密的 `.dat` 图片（包括基于 HEVC 的 wxgf 格式，用 macOS 自带的 `sips` 转为 JPEG）。图片密钥从本地账号文件推导，不需要额外的 `sudo`。如果微信只有缩略图（原图从未下载），先使用缩略图，之后原图出现时再次导出会自动替换
+- **语音 / 视频**：语音（存放在 `message/media_0.db` 中的 SILK v3 数据）用 `silk-python` 解码，再用 macOS 自带的 `afconvert` 编码为 AAC `.m4a`（没有 afconvert 时保存为 WAV）。微信已下载的视频是普通 MP4，直接复制（同一磁盘卷上为 APFS 克隆，不额外占空间）；未下载的视频显示封面。时长取自消息本身。已导出的文件会复用，增量导出只转换新消息。音视频使用 `preload="none"`，大型 HTML 也能快速打开
 - **旧的增量格式**：如果之前用过 `export/<名称>/output_N.txt` 格式，第一次增量导出时会把这些文件合并到 `export/<名称>.txt`，之后可以删除旧文件夹
 
 ## 配置
@@ -91,7 +95,7 @@
 
 WCDB（微信的 SQLCipher 封装层）会在进程内存中缓存派生后的原始密钥，格式为 `x'<64位hex密钥><32位hex盐值>'`。扫描器在微信内存中查找该模式，并通过盐值匹配到对应的数据库。解密前会用第 1 页的 HMAC 校验每个密钥，因此过期的密钥会被自动发现并重新提取。
 
-每个聊天的消息存放在名为 `Msg_<md5(用户名)>` 的表中，内容可能经过 zstd 压缩（WCDB_CT=4）。聊天图片以 `.dat` 文件存放在 `msg/attach/<md5(用户名)>/<年-月>/Img/` 下，前 1 KB 用 AES-128-ECB 加密，其余部分做了 XOR。
+每个聊天的消息存放在名为 `Msg_<md5(用户名)>` 的表中，内容可能经过 zstd 压缩（WCDB_CT=4）。聊天图片以 `.dat` 文件存放在 `msg/attach/<md5(用户名)>/<年-月>/Img/` 下，前 1 KB 用 AES-128-ECB 加密，其余部分做了 XOR。语音是 `message/media_0.db` 中 `VoiceInfo` 表里的 SILK 数据（按聊天 + server id，或 create_time + local_id 对应）；视频是未加密的 `msg/video/<年-月>/<md5>.mp4`（及 `_thumb.jpg`），md5 在消息的 `packed_info_data` 中。
 
 ## 文件说明
 
@@ -105,6 +109,7 @@ WCDB（微信的 SQLCipher 封装层）会在进程内存中缓存派生后的�
 | `chats.py` | 聊天发现、联系人、群成员名称、消息解析 |
 | `formatters.py` | txt / md / html / json / csv 输出 |
 | `image_decode.py` | 解码微信 `.dat` 图片，并把消息对应到图片文件 |
+| `media_decode.py` | 语音（SILK → m4a）和视频查找；`--test N` 在你的数据上检查解码 |
 | `config.py` | 配置加载与自动检测 |
 | `tests/` | 单元测试（使用合成数据）：`./venv/bin/python -m unittest discover -s tests` |
 

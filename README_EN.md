@@ -4,7 +4,7 @@
 
 [中文](README.md)
 
-Our data, we own it! Decrypt WeChat 4.x (macOS) local SQLCipher 4 databases and export your chats — 1-on-1 and group — as text, Markdown, HTML, JSON or CSV, with images.
+Our data, we own it! Decrypt WeChat 4.x (macOS) local SQLCipher 4 databases and export your chats — 1-on-1 and group — as text, Markdown, HTML, JSON or CSV, with images, playable voice messages and videos.
 
 ## Setup
 
@@ -38,6 +38,7 @@ Decrypt on its own with `./wechat decrypt`.
 
 ```bash
 ./wechat ning -f html --images           # chat-style HTML page with images
+./wechat ning -f html --media            # ... plus playable voice messages and videos
 ./wechat ning -i                         # incremental: append new messages to export/<name>.txt
 ./wechat ning --since 2026-01-01 --until 2026-06-30
 ./wechat --all --type group -f md        # all group chats as Markdown
@@ -53,6 +54,8 @@ Decrypt on its own with `./wechat decrypt`.
 | `--list [filter]` | List chats |
 | `--type` | `all` (default), `single` (1-on-1), `group` |
 | `--images` | Decode images into `export/<name>_files/` and embed them in md/html/json (txt/csv show `[图片]`) |
+| `--voice` | Convert voice messages to `export/<name>_files/<id>.m4a`, playable in html (`<audio>`) and linked from md/json; txt/csv show `[语音 12″]` |
+| `--media` | `--images` + `--voice` + copy downloaded videos (`<md5>.mp4`, thumbnail `<md5>_thumb.jpg`) for html `<video>` / md / json; txt/csv show `[视频 0:35]` |
 | `--since` / `--until` | Date range, `YYYY-MM-DD`, inclusive |
 | `-o`, `--output` | Output file (default `export/<name>_chat.<ext>`) |
 | `--export-dir` | Export folder (default `export/`) |
@@ -64,6 +67,7 @@ What the exporter handles:
 - **Chats spanning several databases** (`message_0.db`, `message_1.db`, … — roughly one per year)
 - **Message types**: text, images, voice, video, stickers, links, files, quotes, mini programs, system messages; zstd-compressed messages are decompressed
 - **Images**: WeChat 4.x encrypted `.dat` images (including the HEVC-based wxgf format, converted to JPEG with macOS's built-in `sips`). The image key is derived from local account files — no extra `sudo` needed. When WeChat only has a thumbnail (full image never downloaded), the thumbnail is used and upgraded on a later export once the full image exists
+- **Voice / video**: voice messages (SILK v3 stored in `message/media_0.db`) are decoded with the `silk-python` package and encoded to AAC `.m4a` with macOS's built-in `afconvert` (WAV if unavailable). Videos WeChat has downloaded are plain MP4s and are copied (an APFS clone on the same volume, so no extra space); videos never downloaded show their thumbnail. Durations come from the message. Already exported files are reused, so incremental exports only convert new messages. Audio/video use `preload="none"` so large HTML pages open quickly
 - **Old incremental layout**: if you used the previous `export/<name>/output_N.txt` layout, the first incremental export merges those files into `export/<name>.txt`; the old folder can then be deleted
 
 ## Configuration
@@ -91,7 +95,7 @@ WeChat 4.x encrypts local databases with SQLCipher 4:
 
 WCDB (WeChat's SQLCipher wrapper) caches derived raw keys in process memory as `x'<64hex_enc_key><32hex_salt>'`. The scanner finds that pattern in WeChat's memory and matches keys to databases by salt. Before decrypting, each key is checked against page 1's HMAC, so stale keys are detected and re-extracted automatically.
 
-Each chat's messages live in tables named `Msg_<md5(username)>`; message content may be zstd-compressed (WCDB_CT=4). Chat images are stored as `.dat` files under `msg/attach/<md5(username)>/<YYYY-MM>/Img/`, the first 1 KB AES-128-ECB encrypted and the rest XOR'd.
+Each chat's messages live in tables named `Msg_<md5(username)>`; message content may be zstd-compressed (WCDB_CT=4). Chat images are stored as `.dat` files under `msg/attach/<md5(username)>/<YYYY-MM>/Img/`, the first 1 KB AES-128-ECB encrypted and the rest XOR'd. Voice audio is a SILK blob in `message/media_0.db` (`VoiceInfo`, keyed by chat + server id, or create time + local id); videos are unencrypted `msg/video/<YYYY-MM>/<md5>.mp4` (+ `_thumb.jpg`), with the md5 in the message's `packed_info_data`.
 
 ## Files
 
@@ -105,6 +109,7 @@ Each chat's messages live in tables named `Msg_<md5(username)>`; message content
 | `chats.py` | Chat discovery, contacts, group sender names, message parsing |
 | `formatters.py` | txt / md / html / json / csv writers |
 | `image_decode.py` | Decodes WeChat `.dat` images and maps messages to image files |
+| `media_decode.py` | Voice (SILK → m4a) and video lookup; `--test N` checks decoding on your data |
 | `config.py` | Config loader and auto-detection |
 | `tests/` | Unit tests (synthetic data): `./venv/bin/python -m unittest discover -s tests` |
 
