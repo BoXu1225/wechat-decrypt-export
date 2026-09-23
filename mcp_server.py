@@ -82,6 +82,7 @@ import time
 import traceback
 
 import chats as C
+from config import chmod_private, private_opener, secure_outputs
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
@@ -184,7 +185,7 @@ class MessageIndex:
     def __init__(self, path, self_wxid):
         self.path = path
         self.self_wxid = self_wxid
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        os.makedirs(os.path.dirname(os.path.abspath(path)), mode=0o700, exist_ok=True)
         self.conn = self._open()
 
     def _open(self):
@@ -202,6 +203,8 @@ class MessageIndex:
             return self._open()
         conn.executemany("INSERT OR REPLACE INTO meta(k, v) VALUES (?, ?)", want.items())
         conn.commit()
+        for suffix in ("", "-wal", "-shm"):  # holds message text: owner-only
+            chmod_private(self.path + suffix)
         return conn
 
     def close(self):
@@ -880,8 +883,8 @@ class AccessLog:
             rec["error"] = error
         try:
             with self.lock:
-                os.makedirs(os.path.dirname(self.path), exist_ok=True)
-                with open(self.path, "a", encoding="utf-8") as f:
+                os.makedirs(os.path.dirname(self.path), mode=0o700, exist_ok=True)
+                with open(self.path, "a", encoding="utf-8", opener=private_opener) as f:
                     f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         except OSError as e:
             print(f"[mcp] access log write failed: {e}", file=sys.stderr)
@@ -1034,6 +1037,7 @@ def load_server_config():
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     cfg = load_server_config()
+    secure_outputs(cfg)  # umask 077 + tighten existing outputs (messages go to stderr)
     data = WeChatData(cfg)
     log_path = cfg.get("mcp_access_log") or os.path.join(ROOT, "logs", "mcp_access.jsonl")
     if not os.path.isabs(log_path):

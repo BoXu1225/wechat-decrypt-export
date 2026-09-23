@@ -682,6 +682,8 @@ def main(argv=None):
         parser.error("--since 不能晚于 --until")
 
     cfg = get_config()
+    from config import secure_outputs
+    secure_outputs(cfg)  # 新文件仅本人可读写，并收紧已有输出的权限
     if not args.no_decrypt:
         # 自动解密（跳过未变化的数据库）
         from decrypt_db import main as decrypt_main

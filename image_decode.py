@@ -627,6 +627,7 @@ def main():
     args = ap.parse_args()
 
     cfg = _load_cfg()
+    os.umask(0o077)  # decoded images are private chat content
     if args.aes_key:
         cfg["image_aes_key"] = args.aes_key
     if args.xor_key:

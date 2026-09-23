@@ -15,7 +15,8 @@
  *   sudo ./find_all_keys_macos [pid]
  *   If pid is omitted, automatically finds WeChat PID.
  *
- * Output: JSON file at ./all_keys.json (compatible with decrypt_db.py)
+ * Output: JSON file at ./all_keys.json (compatible with decrypt_db.py),
+ * mode 0600 and, under sudo, owned by the invoking user (SUDO_UID/SUDO_GID).
  */
 
 #include <stdio.h>
@@ -23,6 +24,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <ftw.h>
 #include <pwd.h>
 #include <sys/stat.h>
@@ -88,6 +91,23 @@ static pid_t find_wechat_pid(void) {
         pid = atoi(buf);
     pclose(fp);
     return pid;
+}
+
+/* Create a new 0600 file for writing (never follows a symlink or reuses an
+ * existing file). Under sudo, hand it to the invoking user so the unprivileged
+ * decrypt_db.py can rewrite it and other local users cannot read the keys. */
+static FILE *create_private(const char *path) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    if (fd < 0) return NULL;
+    const char *uid_s = getenv("SUDO_UID"), *gid_s = getenv("SUDO_GID");
+    if (geteuid() == 0 && uid_s && gid_s) {
+        if (fchown(fd, (uid_t)strtoul(uid_s, NULL, 10), (gid_t)strtoul(gid_s, NULL, 10)) != 0)
+            perror("fchown");
+    }
+    fchmod(fd, 0600);
+    FILE *fp = fdopen(fd, "w");
+    if (!fp) close(fd);
+    return fp;
 }
 
 /* Read DB salt (first 16 bytes) and return hex string */
@@ -293,8 +313,15 @@ int main(int argc, char *argv[]) {
      * Uses forward slashes (native macOS paths, valid JSON without escaping).
      */
     const char *out_path = "all_keys.json";
-    FILE *fp = fopen(out_path, "w");
-    if (fp) {
+    const char *tmp_path = "all_keys.json.tmp";
+    umask(077);
+    unlink(tmp_path);
+    FILE *fp = create_private(tmp_path);
+    if (!fp) {
+        fprintf(stderr, "Cannot create %s: %s\n", tmp_path, strerror(errno));
+        return 1;
+    }
+    {
         fprintf(fp, "{\n");
         int first = 1;
         for (int i = 0; i < key_count; i++) {
@@ -311,8 +338,12 @@ int main(int argc, char *argv[]) {
             first = 0;
         }
         fprintf(fp, "\n}\n");
-        fclose(fp);
-        printf("Saved to %s\n", out_path);
+        if (fclose(fp) != 0 || rename(tmp_path, out_path) != 0) {
+            fprintf(stderr, "Cannot write %s: %s\n", out_path, strerror(errno));
+            unlink(tmp_path);
+            return 1;
+        }
+        printf("Saved to %s (mode 0600)\n", out_path);
     }
 
     return 0;

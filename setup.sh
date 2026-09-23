@@ -4,6 +4,7 @@
 #   - creates ./venv and installs requirements
 #   - compiles the memory key scanner
 #   - checks that WeChat is ad-hoc signed (~/WeChat.app), offers to copy + sign it
+#   - makes existing outputs (keys, config, decrypted/, export/, logs/) owner-only
 # It never runs sudo or the key scanner; decryption does that on demand.
 set -euo pipefail
 
@@ -98,7 +99,26 @@ if [[ ! -x find_all_keys_macos || find_all_keys_macos -ot find_all_keys_macos.c 
 fi
 ok "密钥扫描器已就绪"
 
-# ---- 5. WeChat ad-hoc signing ----------------------------------------------
+# ---- 5. Owner-only permissions on our outputs --------------------------------
+# Keys, decrypted databases and exported chats must not be readable by other
+# local users. Only our own output paths (not symlinks, owned by us); the
+# Python entry points do the same on every run and create new files as 0600.
+tightened=()
+for p in all_keys.json config.json decrypted export logs decoded_images; do
+    [[ -e "${p}" && ! -L "${p}" && -O "${p}" ]] || continue
+    if [[ -n "$(find "${p}" -maxdepth 0 -perm +077)" ]]; then
+        find "${p}" \( -type f -o -type d \) -user "$(id -u)" -perm +077 -exec chmod go-rwx {} +
+        tightened+=("${p}")
+    fi
+done
+if (( ${#tightened[@]} )); then
+    ok "已收紧权限（目录 700，文件 600，仅本人可读）: ${tightened[*]}"
+else
+    ok "密钥、配置、解密数据、导出和日志的权限均为仅本人可读"
+fi
+info "（之后解密/导出/MCP 生成的文件也只有本人可读写）"
+
+# ---- 6. WeChat ad-hoc signing ----------------------------------------------
 # Reading process memory needs an ad-hoc signed WeChat. SIP prevents re-signing
 # inside /Applications, so we keep a signed copy at ~/WeChat.app.
 echo
