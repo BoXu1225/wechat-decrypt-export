@@ -73,7 +73,7 @@ class TestTxt(Base):
         buf = io.StringIO()
         F.write_txt(self.records, self.single, buf)
         self.assertEqual(buf.getvalue(), legacy_txt(self.records))
-        self.assertIn(f"[2026-03-01 09:05:07] 我: 你好，世界\n", buf.getvalue())
+        self.assertIn("[2026-03-01 09:05:07] 我: 你好，世界\n", buf.getvalue())
 
     def test_file_bytes_identical_and_append(self):
         p = self.out("c.txt")

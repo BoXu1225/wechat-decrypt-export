@@ -282,7 +282,7 @@ def _decrypt_snapshot(db_path, out_path, enc_key):
     with open(db_path, 'rb') as fin:
         page1 = fin.read(PAGE_SZ)
     if len(page1) < PAGE_SZ:
-        print(f"  [!] 文件太小")
+        print("  [!] 文件太小")
         return None
 
     # 验证page 1
@@ -326,7 +326,7 @@ def _decrypt_snapshot(db_path, out_path, enc_key):
             decrypted = decrypt_page(enc_key, page, pgno)
             if pgno == 1:
                 if decrypted[:16] != SQLITE_HDR:
-                    print(f"  [!] 解密后 header 不匹配!")
+                    print("  [!] 解密后 header 不匹配!")
                 hdr = bytearray(decrypted)
                 hdr[18] = hdr[19] = 1                         # 普通 rollback 模式，不需要 -wal/-shm
                 hdr[28:32] = struct.pack('>I', total_pages)   # 库大小以最后一次提交为准
@@ -354,7 +354,7 @@ def decrypt_database(db_path, out_path, enc_key):
         for _ in range(SNAPSHOT_RETRIES):
             before = source_sig(db_path)
             if before is None:
-                print(f"  [!] 文件不存在")
+                print("  [!] 文件不存在")
                 return False
             info = _decrypt_snapshot(db_path, tmp, enc_key)
             if info is None:
@@ -364,8 +364,8 @@ def decrypt_database(db_path, out_path, enc_key):
                 os.replace(tmp, out_path)
                 before["wal_info"] = info
                 return before
-            print(f"  [!] 解密期间数据库被修改，重试 ...")
-        print(f"  [!] 数据库持续变化，放弃本次解密")
+            print("  [!] 解密期间数据库被修改，重试 ...")
+        print("  [!] 数据库持续变化，放弃本次解密")
         return False
     finally:
         if os.path.exists(tmp):

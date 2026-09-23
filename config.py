@@ -86,7 +86,7 @@ def load_config():
             if not os.path.exists(CONFIG_FILE):
                 with open(CONFIG_FILE, "w") as f:
                     json.dump(_DEFAULT, f, indent=4)
-            print(f"[!] 未能自动检测微信数据目录")
+            print("[!] 未能自动检测微信数据目录")
             print(f"    请手动编辑 {CONFIG_FILE} 中的 db_dir 字段")
             print(f"    路径位于 {_XWECHAT_FILES}/<你的微信ID>/db_storage")
             sys.exit(1)
