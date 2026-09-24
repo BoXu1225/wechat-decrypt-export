@@ -17,7 +17,7 @@ STAMP="$HERE/build/.source-hash"
 FORCE=0
 [[ "${1:-}" == "--force" ]] && FORCE=1
 
-HASH="$( (cat "$HERE/Info.plist" "$HERE"/Sources/*.swift; security find-certificate -c "WeChatSendHelper Local Signing" -Z 2>/dev/null | grep SHA-1) | shasum -a 256 | cut -d' ' -f1)"
+HASH="$( (cat "$HERE/Info.plist" "$HERE"/Sources/*.swift; security find-certificate -c "WeChatSendHelper Local Signing" -Z 2>/dev/null | grep SHA-1 || true) | shasum -a 256 | cut -d' ' -f1)"
 if [[ $FORCE == 0 && -x "$APP/Contents/MacOS/WeChatSendHelper" && -f "$STAMP" \
       && "$(cat "$STAMP")" == "$HASH" ]]; then
     echo "[+] WeChatSendHelper.app is up to date (sources unchanged)"
