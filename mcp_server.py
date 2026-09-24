@@ -20,7 +20,8 @@ Claude Desktop (~/Library/Application Support/Claude/claude_desktop_config.json)
 Manual smoke test: `venv/bin/python mcp_server.py --selftest` prints a short
 summary to stderr (no message content) and exits.
 
-Tools (all read-only; results are compact JSON, times are local ISO strings):
+Tools (all read-only; results are compact text lines -- one per message/chat/hit --
+with times in local time; errors are JSON):
     list_chats(filter="", type="all"|"single"|"group", limit=50)
     get_messages(chat, since=None, until=None, limit=200, before=None,
                  after=None, from_start=False, newest_first=False)
@@ -58,6 +59,7 @@ Optional config.json keys:
     "mcp_blocklist": [names or usernames]   hidden from every tool
     "mcp_allowlist": [names or usernames]   if non-empty, only these are visible
     "mcp_auto_refresh_minutes": 5
+    "mcp_output": "json"                    return JSON objects instead of text lines
     "mcp_index_path": "decrypted/mcp_index.db"
     "mcp_access_log": "logs/mcp_access.jsonl"
 Names match a username, remark, nickname, alias or display name exactly.
@@ -978,6 +980,238 @@ def dumps(obj):
 
 
 # ---------------------------------------------------------------------------
+# Compact text rendering
+# ---------------------------------------------------------------------------
+# Tool results go into the agent's context, so the default output is plain
+# lines rather than JSON: one line per message ("HH:MM sender: text") under a
+# date line, the chat named once in a header. Messages with media carry their
+# id ("#N:local_id") for get_image / get_voice. config.json
+# "mcp_output": "json" restores the JSON objects the data layer returns.
+
+MEDIA_KINDS = ("image", "voice", "video")
+
+
+def _day(t):
+    return (t or "")[:10]
+
+
+def _hm(t):
+    return (t or "")[11:16]
+
+
+def _when(t):
+    return (t or "")[:16].replace("T", " ")
+
+
+def _oneline(text):
+    return " ".join((text or "").split())
+
+
+def _indent(text, pad="  "):
+    return (text or "").replace("\r\n", "\n").replace("\n", "\n" + pad)
+
+
+def _chat_ref(c):
+    kind = "group" if c.get("is_group") else "1:1"
+    return f"{c['name']} ({c['username']}, {kind})"
+
+
+def _message_lines(msgs):
+    out, day = [], None
+    for m in msgs:
+        if _day(m["time"]) != day:
+            day = _day(m["time"])
+            out.append(f"[{day}]")
+        line = f"{_hm(m['time'])} {m['sender']}: {_indent(m.get('text') or '')}"
+        if m.get("kind") in MEDIA_KINDS or m.get("anchor"):
+            line += f" #{m['id']}"
+        out.append(("> " if m.get("anchor") else "") + line)
+    return out
+
+
+def _render_list_chats(r):
+    head = f"{r['count']} of {r['total']} chats, most recent first (name | username | type | messages | last)"
+    return [head] + [
+        f"{c['name']} | {c['username']} | {'group' if c['is_group'] else '1:1'} | "
+        f"{c['msg_count']} | {_when(c['last_time'])}" for c in r["chats"]]
+
+
+def _render_messages(r):
+    head = f"{_chat_ref(r['chat'])}: {r['count']} messages"
+    more = []
+    if r.get("has_more_before"):
+        more.append(f"older: before=\"{r['before_cursor']}\"")
+    if r.get("has_more_after"):
+        more.append(f"newer: after=\"{r['after_cursor']}\"")
+    if more:
+        head += "; " + ", ".join(more)
+    return [head] + _message_lines(r["messages"])
+
+
+def _render_context(r):
+    return [f"{_chat_ref(r['chat'])}: {r['count']} messages around #{r['anchor_id']} (marked >)"] \
+        + _message_lines(r["messages"])
+
+
+def _render_search(r):
+    res = r["results"]
+    head = f"search {r['query']!r}: {r['count']} hits, newest first"
+    if r.get("has_more"):
+        head += " (more: narrow with chat/since/until or raise limit)"
+    out = [head]
+    if not res:
+        return out
+    out.append("context: get_message_context(chat=<username>, message_id=<#id>)")
+    by_chat = {}
+    for x in res:
+        by_chat.setdefault((x["chat"], x["chat_username"]), []).append(x)
+    for (name, user), hits in by_chat.items():
+        out.append(f"## {name} ({user})")
+        out += [f"{_when(x['time'])} #{x['id']} {x['sender']}: {_oneline(x['snippet'])}"
+                for x in hits]
+    return out
+
+
+def _render_contact(r):
+    ident = [f"{r['name']} ({r['username']})", "group" if r["is_group"] else
+             ("friend" if r.get("is_friend") else "not a friend")]
+    ident += [f"{k}: {r[k]}" for k in ("remark", "nickname", "alias") if r.get(k)]
+    out = [" | ".join(ident)]
+    c = r.get("chat")
+    if c:
+        out.append(f"chat: {c['msg_count']} messages ({c['sent_by_me']} by me, "
+                   f"{c['sent_by_them']} by them), {_day(c['first_time'])} to {_day(c['last_time'])}")
+    if r["is_group"]:
+        out.append(f"members ({r['member_count']}): " + ", ".join(
+            f"{m['name']} ({m['username']})" for m in r["members"]))
+    elif r.get("shared_groups") is not None:
+        out.append(f"shared groups ({r['shared_group_count']}; name | username | members | "
+                   "their nickname | messages | last):")
+        out += [f"  {g['name']} | {g['username']} | {g['member_count']} | "
+                f"{g['their_group_nickname'] or '-'} | {g['msg_count']} | {_when(g['last_time'])}"
+                for g in r["shared_groups"]]
+    return out
+
+
+def _render_moments(r):
+    head = f"{r['count']} of {r['total']} Moments posts, newest first"
+    if r.get("has_more"):
+        head += " (more: narrow with since/until or raise limit)"
+    out = [head] + ([r["note"]] if r.get("note") else [])
+    for p in r["posts"]:
+        meta = [f"#{p['id']}", _when(p["time"]), f"{p['author']} ({p['author_username']})"]
+        if p.get("kind"):
+            meta.append(p["kind"])
+        m = p.get("media")
+        if m:
+            parts = [f"{m[k]} {k}" for k in ("images", "videos") if m[k]]
+            meta.append(", ".join(parts) + f" ({m['cached_locally']} cached)")
+        if p.get("location"):
+            meta.append(f"at {p['location']}")
+        if p.get("private"):
+            meta.append("private")
+        out.append(" | ".join(meta))
+        if p.get("text"):
+            out.append("  " + _indent(p["text"], "  "))
+        link = " - ".join(p[k] for k in ("title", "description", "source") if p.get(k))
+        if link or p.get("url"):
+            out.append("  link: " + " ".join(x for x in (_oneline(link), p.get("url")) if x))
+        if p.get("with"):
+            out.append("  with: " + ", ".join(p["with"]))
+        if p.get("likes"):
+            out.append("  likes: " + ", ".join(p["likes"]))
+        for c in p.get("comments") or []:
+            who = c["name"] + (f" -> {c['reply_to']}" if c.get("reply_to") else "")
+            out.append(f"  {_when(c['time'])} {who}: {_oneline(c['text'])}")
+        if p.get("comments_truncated"):
+            out.append(f"  (+{p['comments_truncated']} more comments)")
+    return out
+
+
+def _fav_source_text(s):
+    if not s:
+        return ""
+    parts = [s.get("sender_name"), s.get("chat_name")]
+    txt = " in ".join(x for x in parts if x)
+    if s.get("chat_username"):
+        txt += f" ({s['chat_username']})"
+    return txt
+
+
+def _render_favorites(r):
+    head = f"{r['count']} of {r['total']} favorites, newest first"
+    if r.get("has_more"):
+        head += " (more: narrow the query or raise limit)"
+    out = [head]
+    if r["favorites"]:
+        out.append("full item: get_favorite(id)")
+    for f in r["favorites"]:
+        parts = [f"#{f['id']}", _when(f["time"]), f["type"]]
+        for k in ("title", "snippet", "url"):
+            if f.get(k):
+                parts.append(_oneline(f[k]))
+        if f.get("source"):
+            parts.append("from " + _fav_source_text(f["source"]))
+        if f.get("tags"):
+            parts.append("tags: " + ", ".join(f["tags"]))
+        if f.get("item_count"):
+            parts.append(f"{f['item_count']} items")
+        out.append(" | ".join(parts))
+    return out
+
+
+def _render_favorite(r):
+    parts = [f"#{r['id']}", _when(r["time"]), r["type"]]
+    if r.get("source"):
+        parts.append("from " + _fav_source_text(r["source"]))
+    if r.get("tags"):
+        parts.append("tags: " + ", ".join(r["tags"]))
+    out = [" | ".join(parts)]
+    for k in ("title", "url"):
+        if r.get(k):
+            out.append(f"{k}: {_oneline(r[k])}")
+    if r.get("location"):
+        loc = r["location"]
+        out.append("location: " + (_oneline(" ".join(str(v) for v in loc.values() if v))
+                                   if isinstance(loc, dict) else str(loc)))
+    if r.get("text"):
+        out.append(_indent(r["text"], ""))
+    for it in r.get("items") or []:
+        head = " ".join(str(it[k]) for k in ("time", "sender_name") if it.get(k))
+        body = " ".join(_oneline(str(it[k])) for k in ("title", "desc", "url") if it.get(k))
+        extra = ", ".join(f"{k} {it[k]}" for k in ("fmt", "size", "duration") if it.get(k))
+        line = f"- [{it['type']}]" + (f" {head}:" if head else "") + (f" {body}" if body else "")
+        out.append(line + (f" ({extra})" if extra else ""))
+    if r.get("items_truncated"):
+        out.append(f"(+{r['items_truncated']} more items)")
+    return out
+
+
+RENDERERS = {
+    "list_chats": _render_list_chats,
+    "get_messages": _render_messages,
+    "get_message_context": _render_context,
+    "search_messages": _render_search,
+    "get_contact": _render_contact,
+    "get_moments": _render_moments,
+    "search_favorites": _render_favorites,
+    "get_favorite": _render_favorite,
+}
+
+
+def render(tool, res, fmt="text"):
+    """Tool result -> the string sent to the agent. Errors and anything without
+    a renderer stay JSON."""
+    fn = RENDERERS.get(tool)
+    if fmt == "json" or fn is None or not isinstance(res, dict) or "error" in res:
+        return dumps(res)
+    out = fn(res)
+    if res.get("notice"):
+        out.append(f"note: {res['notice'] if isinstance(res['notice'], str) else dumps(res['notice'])}")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
 # MCP wiring
 # ---------------------------------------------------------------------------
 
@@ -1006,16 +1240,17 @@ def build_server(data, log, lifespan=None):
     srv = Server("wechat", instructions=INSTRUCTIONS, lifespan=lifespan)
     ro = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True,
                          openWorldHint=False)
+    fmt = data.cfg.get("mcp_output", "text")
 
     def run(tool, args, fn):
-        return dumps(call_tool(data, log, tool, args, fn))
+        return render(tool, call_tool(data, log, tool, args, fn), fmt)
 
     @srv.tool(annotations=ro, structured_output=False)
     def list_chats(filter: str = "", type: Literal["all", "single", "group"] = "all",
                    limit: int = 50) -> str:
         """List chats (1-on-1 and groups) sorted by last activity.
-        filter: substring of name/remark/username. Returns name, username, is_group,
-        msg_count, last_time."""
+        filter: substring of name/remark/username. One line per chat:
+        name | username | type | messages | last."""
         a = dict(filter=filter, type=type, limit=limit)
         return run("list_chats", a, lambda: data.list_chats(**a))
 
@@ -1027,7 +1262,9 @@ def build_server(data, log, lifespan=None):
         order. Page back with before=<before_cursor>, forward with after=<after_cursor>.
         from_start=True returns the earliest messages in the since/until range instead.
         since/until: 'YYYY-MM-DD', 'YYYY-MM-DD HH:MM', unix seconds, or '7d'/'12h'.
-        Each message: id, time, sender ("我" = the user), kind (omitted for text), text."""
+        Output: a header (chat, count, cursors), then "[date]" lines and one line per
+        message "HH:MM sender: text" ("我" = the user); image/voice/video lines end
+        with their "#id" for get_image / get_voice."""
         a = dict(chat=chat, since=since, until=until, limit=limit, before=before, after=after,
                  from_start=from_start, newest_first=newest_first)
         return run("get_messages", a, lambda: data.get_messages(**a))
@@ -1038,8 +1275,8 @@ def build_server(data, log, lifespan=None):
                         limit: int = 50) -> str:
         """Full-text search over all chats (or one chat), newest first. Space-separated
         terms are ANDed; substring match, works for Chinese. sender: substring of the
-        sender's display name. Returns chat, chat_username, id, time, sender, snippet;
-        pass chat_username + id to get_message_context for the surrounding conversation."""
+        sender's display name. Hits grouped under "## chat (username)", one line each:
+        "date time #id sender: snippet"; pass username + id to get_message_context."""
         a = dict(query=query, chat=chat, since=since, until=until, sender=sender, limit=limit)
         return run("search_messages", a, lambda: data.search_messages(**a))
 
@@ -1047,7 +1284,8 @@ def build_server(data, log, lifespan=None):
     def get_message_context(chat: str, message_id: Optional[str] = None,
                             time: Optional[str] = None, before: int = 10, after: int = 10) -> str:
         """Messages around one message (by id, e.g. from search_messages) or around a time.
-        The anchor message is marked "anchor": true. before/after max 100."""
+        Same line format as get_messages; the anchor line starts with "> ".
+        before/after max 100."""
         a = dict(chat=chat, message_id=message_id, time=time, before=before, after=after)
         return run("get_message_context", a, lambda: data.get_message_context(**a))
 
@@ -1374,9 +1612,10 @@ def favorite_get(data, id):
 
 def register_social_tools(srv, data, log, ro):
     from typing import Optional
+    fmt = data.cfg.get("mcp_output", "text")
 
     def run(tool, args, fn):
-        return dumps(call_tool(data, log, tool, args, fn))
+        return render(tool, call_tool(data, log, tool, args, fn), fmt)
 
     @srv.tool(annotations=ro, structured_output=False)
     def get_moments(author: Optional[str] = None, since: Optional[str] = None,
@@ -1387,7 +1626,7 @@ def register_social_tools(srv, data, log, ro):
         ("我" = the user); query: space-separated terms (all must match) over post text,
         link title, location and comments. Each post: id, time, author, kind (omitted for
         photo posts), text, title/url for shared links, location, media counts, likes
-        (names) and comments (name, time, text, reply_to). limit max 500."""
+        (names) and comments (time, name -> reply_to: text). limit max 500."""
         a = dict(author=author, since=since, until=until, limit=limit, query=query)
         return run("get_moments", a, lambda: moments_query(data, **a))
 
@@ -1399,7 +1638,7 @@ def register_social_tools(srv, data, log, ro):
         terms (substring, all must match) over title, text, URL, tags, source names and
         chat-record contents; omit to list. type: text, image, voice, video, link, location,
         music, file, chat_record, note, miniprogram, channels, product, other.
-        Returns id, time, type, title, snippet, url, source, tags."""
+        One line each: #id | time | type | title | snippet | url | from | tags."""
         a = dict(query=query, type=type, since=since, until=until, limit=limit)
         return run("search_favorites", a, lambda: favorites_search(data, **a))
 

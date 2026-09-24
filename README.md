@@ -139,6 +139,7 @@ Claude Desktop（`~/Library/Application Support/Claude/claude_desktop_config.jso
 - **只读。** 除 `refresh` 外所有工具都标记为只读，不会在微信里发送或修改任何东西。
 - **访问范围：** 默认所有聊天可见。要隐藏某些聊天，在 `config.json` 中加 `"mcp_blocklist": ["名称或 wxid", …]`；`"mcp_allowlist"` 非空时只显示列出的聊天。每次调用都记录在 `logs/mcp_access.jsonl`（工具、参数、结果数量，不含消息内容）。
 - **数据新鲜度：** 读取前会用已有密钥重新解密有变化的数据库，最多每 `mcp_auto_refresh_minutes` 分钟一次（默认 5，`0` 关闭）。它不会运行密钥扫描器；密钥过期时会提示你运行 `./wechat decrypt`。微信会把最新写入暂存在 WAL 中，最新消息可能略有延迟。
+- **紧凑输出：** 结果是纯文本行——日期行下每条消息一行 `HH:MM 发送者: 内容`，聊天名只出现一次——比 JSON 小约 60–70%，助手可以读更长的聊天记录。需要 JSON 时在 `config.json` 中设置 `"mcp_output": "json"`。
 - **搜索索引：** 首次使用时在 `decrypted/mcp_index.db` 建立（约 20 万条消息需几秒），之后增量更新。
 - **自检：** `./venv/bin/python mcp_server.py --selftest` 输出统计数字（不含消息内容）后退出。
 
