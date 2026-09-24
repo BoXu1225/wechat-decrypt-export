@@ -24,7 +24,7 @@ import Foundation
 import ScreenCaptureKit
 import Vision
 
-let helperVersion = "5"
+let helperVersion = "8"
 let wechatBundleID = "com.tencent.xinWeChat"
 
 // MARK: - Errors / JSON
@@ -149,6 +149,9 @@ final class Driver {
     var pid: pid_t = 0
     var app: AXUIElement?
     var searchArmed = false
+    var sessionStart: Date?
+    var ownEvents: [Date] = []
+    let banner = Banner()
     var searchField: AXUIElement?
 
     // --- state ---
@@ -228,6 +231,7 @@ final class Driver {
 
     func requireFront() throws {
         try requireReady()
+        try checkUserActivity()
         guard frontmost()?.processIdentifier == pid else {
             throw OpError("not_frontmost", "WeChat is not the frontmost app")
         }
@@ -240,6 +244,7 @@ final class Driver {
         for down in [true, false] {
             guard let ev = CGEvent(keyboardEventSource: src, virtualKey: k.rawValue, keyDown: down) else { continue }
             ev.flags = cmd ? .maskCommand : []
+            noteOwnEvent()
             ev.postToPid(pid)
             sleepMs(25)
         }
@@ -249,6 +254,7 @@ final class Driver {
         let saved = CGEvent(source: nil)?.location
         let pt = CGPoint(x: rect.midX, y: rect.midY)
         for type in [CGEventType.leftMouseDown, .leftMouseUp] {
+            noteOwnEvent()
             CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: pt,
                     mouseButton: .left)?.post(tap: .cghidEventTap)
             sleepMs(40)
@@ -658,6 +664,9 @@ final class Driver {
         case "send": return try send(req)
         case "probe": return try probe(req)
         case "v_ocr": return try vOCR(req)
+        case "idle": return try vIdle(req)
+        case "session_begin": return try sessionBegin(req)
+        case "session_end": return try sessionEnd(req)
         case "v_open_search": return try vOpenSearch(req)
         case "v_search_enter": return try vSearchEnter(req)
         case "v_click_popup": return try vClickPopup(req)
@@ -674,7 +683,7 @@ let opTimeouts: [String: Double] = [
     "open_search": 6, "search_results": 6, "click_result": 6, "search_enter": 4,
     "escape": 3, "chat_title": 6, "input_text": 4, "paste_input": 6,
     "clear_input": 4, "send": 6, "probe": 30,
-    "v_ocr": 10, "v_open_search": 6, "v_search_enter": 10, "v_paste": 6, "v_clear": 5, "v_click_popup": 8,
+    "v_ocr": 10, "v_open_search": 6, "v_search_enter": 10, "v_paste": 6, "v_clear": 5, "v_click_popup": 8, "idle": 2, "session_begin": 3, "session_end": 3,
     "v_send": 25,
 ]
 
@@ -830,6 +839,127 @@ final class Server {
     }
 }
 
+
+
+// MARK: - Send session: on-screen banner + user-activity guard
+//
+// A send takes ~10 s of real keyboard focus. session_begin shows a small
+// banner ("Sending to X -- hands off") and starts watching for the user's own
+// input; every UI op after that fails with "user_activity" if the user pressed
+// a key, clicked or scrolled since the session began (the helper's own posted
+// events are excluded). session_end shows the outcome briefly and hides it.
+// The banner is a non-activating panel that ignores the mouse, so it never
+// takes focus; it isn't captured either (captures are per-window).
+
+final class Banner {
+    var panel: NSPanel?
+    var label: NSTextField?
+    var hideAt: Date?
+
+    func show(_ text: String, color: NSColor) {
+        if panel == nil {
+            let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 460, height: 44),
+                            styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            p.level = .statusBar
+            p.isOpaque = false
+            p.backgroundColor = .clear
+            p.ignoresMouseEvents = true
+            p.hasShadow = true
+            p.hidesOnDeactivate = false
+            p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+            let bg = NSVisualEffectView(frame: p.contentView!.bounds)
+            bg.material = .hudWindow
+            bg.state = .active
+            bg.wantsLayer = true
+            bg.layer?.cornerRadius = 12
+            bg.autoresizingMask = [.width, .height]
+            let l = NSTextField(labelWithString: "")
+            l.font = .systemFont(ofSize: 14, weight: .semibold)
+            l.alignment = .center
+            l.lineBreakMode = .byTruncatingTail
+            l.frame = NSRect(x: 12, y: 12, width: 436, height: 20)
+            l.autoresizingMask = [.width]
+            bg.addSubview(l)
+            p.contentView = bg
+            panel = p
+            label = l
+        }
+        label?.stringValue = text
+        label?.textColor = color
+        if let screen = NSScreen.main, let p = panel {
+            let f = screen.visibleFrame
+            p.setFrameOrigin(NSPoint(x: f.midX - p.frame.width / 2, y: f.maxY - p.frame.height - 12))
+        }
+        hideAt = nil
+        panel?.orderFrontRegardless()
+        panel?.display()
+    }
+
+    func hide(after seconds: Double) {
+        let at = Date(timeIntervalSinceNow: seconds)
+        hideAt = at
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
+            guard let self = self, self.hideAt == at else { return }
+            self.panel?.orderOut(nil)
+        }
+    }
+}
+
+let userInputTypes: [CGEventType] = [.keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel]
+
+extension Driver {
+    /// Seconds since the last user keyboard / click / scroll event (any
+    /// process), and since any input at all (including mouse movement).
+    func idleTimes() -> (input: Double, any: Double) {
+        let input = userInputTypes.map {
+            CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: $0)
+        }.min() ?? .infinity
+        let any = CGEventSource.secondsSinceLastEventType(.combinedSessionState,
+                                                         eventType: CGEventType(rawValue: ~0)!)
+        return (input, any)
+    }
+
+    /// Throws user_activity if the user pressed a key / clicked / scrolled
+    /// since the session began. Our own events are recorded in ownEvents and
+    /// an input event within 0.4 s after one of them is attributed to us.
+    func checkUserActivity() throws {
+        guard let start = sessionStart else { return }
+        let now = Date()
+        let last = now.addingTimeInterval(-idleTimes().input)
+        guard last > start.addingTimeInterval(0.05) else { return }
+        let ours = ownEvents.contains { last >= $0.addingTimeInterval(-0.05) && last <= $0.addingTimeInterval(0.4) }
+        if !ours {
+            throw OpError("user_activity", "you used the keyboard or mouse during the send; stopped")
+        }
+    }
+
+    func noteOwnEvent() {
+        if sessionStart != nil { ownEvents.append(Date()) }
+    }
+
+    func vIdle(_ req: JSON) throws -> JSON {
+        let t = idleTimes()
+        return ["input_idle_s": t.input.isFinite ? t.input : 1e9, "any_idle_s": t.any.isFinite ? t.any : 1e9]
+    }
+
+    func sessionBegin(_ req: JSON) throws -> JSON {
+        let text = (req["banner"] as? String) ?? "Sending a WeChat message — hands off the keyboard and mouse"
+        sessionStart = Date()
+        ownEvents = []
+        banner.show(String(text.prefix(120)), color: .labelColor)
+        return [:]
+    }
+
+    func sessionEnd(_ req: JSON) throws -> JSON {
+        let ok = (req["ok"] as? Bool) ?? false
+        let text = (req["banner"] as? String) ?? (ok ? "Sent" : "Stopped")
+        sessionStart = nil
+        ownEvents = []
+        banner.show(String(text.prefix(120)), color: ok ? .systemGreen : .systemOrange)
+        banner.hide(after: (req["linger_s"] as? Double) ?? 2.5)
+        return [:]
+    }
+}
 
 // MARK: - Vision mode (WeChat 4 exposes no accessibility tree)
 //
@@ -1001,6 +1131,7 @@ extension Driver {
 
     func vOCR(_ req: JSON) throws -> JSON {
         try requireReady()
+        try checkUserActivity()  // e.g. Esc closed the search results mid-send
         let rect = req["rect"] == nil ? nil : try rectArg(req, "rect")
         let (items, size) = try ocr(rect, popup: (req["popup"] as? Bool) ?? false)
         let maxItems = min((req["max_items"] as? Int) ?? 200, 1000)
@@ -1080,8 +1211,24 @@ extension Driver {
     }
 
     func vClear(_ req: JSON) throws -> JSON {
-        try requireFront()
         searchArmed = false
+        if let expected = req["expected_input"] as? String {
+            // Undo our own paste after the user interrupted: skip the activity
+            // check, but only if WeChat is still in front and the input box
+            // still holds exactly the text we pasted (nothing of the user's).
+            try requireReady()
+            guard frontmost()?.processIdentifier == pid else {
+                throw OpError("not_frontmost", "WeChat is not the frontmost app")
+            }
+            let rect = try rectArg(req, "input_rect")
+            let winHeight = try windowOrigin().height
+            let seen = joined(try ocr(rect).items)
+            guard rect.minY >= winHeight * 0.5, !expected.isEmpty, seen == expected else {
+                throw OpError("precondition_failed", "input box no longer holds only our text")
+            }
+        } else {
+            try requireFront()
+        }
         try clickLower(try pointArg(req))
         key(.a, cmd: true)
         key(.delete)
@@ -1117,6 +1264,7 @@ extension Driver {
         guard frontmost()?.processIdentifier == pid else {
             throw OpError("not_frontmost", "WeChat lost focus")
         }
+        try checkUserActivity()
         key(.returnKey, cmd: keyName == "cmd_enter")
         var leftover = expectedInput
         for _ in 0..<10 {
