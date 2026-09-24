@@ -840,6 +840,14 @@ class VisionDriverTests(unittest.TestCase):
         self.assertTrue(W.ocr_matches(msg.replace("longer", "1onger"), msg))  # one misread
         self.assertFalse(W.ocr_matches(msg[:20], msg))  # truncated read-back
         self.assertFalse(W.ocr_matches("hi", "ho"))  # short texts must be exact
+        # short texts: one look-alike hanzi is tolerated, nothing else
+        self.assertTrue(W.ocr_matches("这周未去跑步吗", "这周末去跑步吗"))
+        self.assertTrue(W.ocr_matches("明天去run吗".replace("天", "夭"), "明天去run吗"))
+        self.assertFalse(W.ocr_matches("这周未去跑步呢", "这周末去跑步吗"))  # two
+        self.assertFalse(W.ocr_matches("明天去ran吗", "明天去run吗"))  # a letter
+        self.assertFalse(W.ocr_matches("转账700元", "转账100元"))  # a digit
+        self.assertFalse(W.ocr_matches("好的吗", "好的吧"))  # too short
+        self.assertFalse(W.ocr_matches("这周末去跑步吗了", "这周末去跑步吗"))  # extra
         self.assertFalse(W.ocr_matches("", msg))
 
     def test_full_send_flow(self):
