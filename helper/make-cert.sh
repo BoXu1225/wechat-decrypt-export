@@ -43,3 +43,14 @@ openssl pkcs12 -export -legacy -inkey "$TMP/key.pem" -in "$TMP/cert.pem" \
     -name "$NAME" -passout "pass:$PASS" -out "$TMP/id.p12"
 security import "$TMP/id.p12" -k "$KEYCHAIN" -P "$PASS" -T /usr/bin/codesign >/dev/null
 echo "[+] created signing identity '$NAME' in the login keychain"
+
+# Let Apple's signing tools use the key without a keychain prompt on every
+# build (only this key; asks for the login password once).
+if [[ -t 0 ]]; then
+    echo "[i] macOS needs your login password once so builds don't prompt each time:"
+    security set-key-partition-list -S apple-tool:,apple:,codesign: -s -l "$NAME" "$KEYCHAIN" >/dev/null \
+        || echo "[i] skipped; each build may ask for the keychain password"
+else
+    echo "[i] to stop keychain prompts on every build, run once in a terminal:"
+    echo "    security set-key-partition-list -S apple-tool:,apple:,codesign: -s -l \"$NAME\" $KEYCHAIN"
+fi
