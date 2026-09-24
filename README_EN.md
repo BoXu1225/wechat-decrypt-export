@@ -139,6 +139,7 @@ Then ask things like "what did 张三 and I decide about the trip last week?" or
 - **Read-only.** Every tool except `refresh` is marked read-only; nothing is sent or changed in WeChat.
 - **Access:** all chats are visible by default. To hide some, add `"mcp_blocklist": ["name or wxid", …]` to `config.json`; a non-empty `"mcp_allowlist"` shows only the chats listed. Every call is logged to `logs/mcp_access.jsonl` (tool, arguments, result count — no message content).
 - **Freshness:** before reads the server re-decrypts changed databases with the existing keys, at most every `mcp_auto_refresh_minutes` (default 5, `0` disables). It never runs the key scanner; if keys are stale it tells you to run `./wechat decrypt`. The newest messages can lag a little because WeChat holds recent writes in its WAL until it checkpoints.
+- **Compact output:** results are plain lines — `HH:MM sender: text` under a date line, the chat named once — about 60–70% smaller than JSON, so agents can read long histories. Set `"mcp_output": "json"` in `config.json` for JSON objects instead.
 - **Search index:** built on first use at `decrypted/mcp_index.db` (a few seconds for ~200k messages) and updated incrementally.
 - **Check:** `./venv/bin/python mcp_server.py --selftest` prints counts (no message content) and exits.
 

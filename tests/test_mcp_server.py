@@ -361,6 +361,27 @@ class PolicyTest(Base):
 
 
 class DispatchTest(Base):
+    def test_render_text(self):
+        msgs = self.data.get_messages(ALICE, limit=3)
+        out = M.render("get_messages", msgs).split("\n")
+        self.assertTrue(out[0].startswith("Alice R ("))
+        self.assertRegex(out[1], r"^\[\d{4}-\d\d-\d\d\]$")
+        self.assertRegex(out[2], r"^\d\d:\d\d \S+: ")
+        img = [m for m in msgs["messages"] if m.get("kind") == "image"]
+        for m in img:
+            self.assertIn(f"#{m['id']}", M.render("get_messages", msgs))
+        res = self.data.search_messages("compressed")
+        text = M.render("search_messages", res)
+        self.assertIn(f"## Alice R ({ALICE})", text)
+        self.assertEqual(text.count(ALICE), 1)  # once in the chat header, not per hit
+        ctx = self.data.get_message_context(ALICE, message_id=res["results"][0]["id"])
+        self.assertIn("\n> ", M.render("get_message_context", ctx))
+        self.assertEqual(json.loads(M.render("get_messages", msgs, "json")), msgs)
+        self.assertEqual(json.loads(M.render("get_messages", {"error": "x"})), {"error": "x"})
+        for tool, res in (("list_chats", self.data.list_chats()),
+                          ("get_contact", self.data.get_contact(ALICE))):
+            self.assertNotIn("{", M.render(tool, res))
+
     def test_access_log_has_no_content(self):
         log_path = os.path.join(self.tmp, "logs", "access.jsonl")
         log = M.AccessLog(log_path)
@@ -403,10 +424,14 @@ class DispatchTest(Base):
                                          "get_message_context", "get_contact", "get_image",
                                          "get_voice", "refresh"}, tools)
                 r = await client.call_tool("list_chats", {"type": "single"})
-                payload = json.loads(r.content[0].text)
-                self.assertEqual(payload["chats"][0]["username"], ALICE)
+                lines = r.content[0].text.split("\n")
+                self.assertIn(f"| {ALICE} | 1:1 |", lines[1])
                 r = await client.call_tool("get_messages", {"chat": "Alice R", "limit": 2})
-                self.assertEqual(json.loads(r.content[0].text)["count"], 2)
+                text = r.content[0].text
+                self.assertIn(f"({ALICE}, 1:1): 2 messages", text.split("\n")[0])
+                self.assertNotIn('"sender"', text)
+                r = await client.call_tool("get_messages", {"chat": "nobody-xyz"})
+                self.assertIn("error", json.loads(r.content[0].text))
                 r = await client.call_tool("get_image", {"chat": ALICE, "message_id": "0:2"})
                 self.assertEqual(r.content[0].type, "image")
                 self.assertEqual(r.content[0].mime_type, "image/jpeg")
