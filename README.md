@@ -110,7 +110,7 @@
 
 ## AI 助手（MCP 服务器）
 
-`mcp_server.py` 让 Claude Code、Claude Desktop 等 MCP 客户端读取你的聊天记录。先解密一次（`./wechat decrypt`），然后注册：
+`mcp_server.py` 让 Claude Code、Claude Desktop 等 MCP 客户端读取你的聊天记录（并在你每次同意后发送消息）。先解密一次（`./wechat decrypt`），然后注册：
 
 ```bash
 claude mcp add --scope user wechat -- "$PWD/venv/bin/python" "$PWD/mcp_server.py"
@@ -135,13 +135,32 @@ Claude Desktop（`~/Library/Application Support/Claude/claude_desktop_config.jso
 | `get_moments` | 本地缓存的朋友圈，可按作者、时间、内容筛选 |
 | `search_favorites` / `get_favorite` | 搜索和读取收藏 |
 | `refresh` | 立即重新解密有变化的数据库 |
+| `send_message` | 发送文字消息（每次先征求同意，见「发送消息」） |
 
-- **只读。** 除 `refresh` 外所有工具都标记为只读，不会在微信里发送或修改任何东西。
+- **除 `send_message` 外只读。** 读取类工具都标记为只读；`send_message` 标记为破坏性操作，客户端每次发送前都会征求同意。
 - **访问范围：** 默认所有聊天可见。要隐藏某些聊天，在 `config.json` 中加 `"mcp_blocklist": ["名称或 wxid", …]`；`"mcp_allowlist"` 非空时只显示列出的聊天。每次调用都记录在 `logs/mcp_access.jsonl`（工具、参数、结果数量，不含消息内容）。
 - **数据新鲜度：** 读取前会用已有密钥重新解密有变化的数据库，最多每 `mcp_auto_refresh_minutes` 分钟一次（默认 5，`0` 关闭）。它不会运行密钥扫描器；密钥过期时会提示你运行 `./wechat decrypt`。微信会把最新写入暂存在 WAL 中，最新消息可能略有延迟。
 - **紧凑输出：** 结果是纯文本行——日期行下每条消息一行 `HH:MM 发送者: 内容`，聊天名只出现一次——比 JSON 小约 60–70%，助手可以读更长的聊天记录。需要 JSON 时在 `config.json` 中设置 `"mcp_output": "json"`。
 - **搜索索引：** 首次使用时在 `decrypted/mcp_index.db` 建立（约 20 万条消息需几秒），之后增量更新。
 - **自检：** `./venv/bin/python mcp_server.py --selftest` 输出统计数字（不含消息内容）后退出。
+
+## 发送消息
+
+`./wechat send`（以及 MCP 工具 `send_message`）像你本人一样操作本机的微信来发送文字消息：搜索聊天、确认打开的是对的聊天、粘贴、核对文字、按回车，最后在数据库里确认消息已发出。
+
+```bash
+helper/install.sh                                   # 一次性：构建并启动 WeChatSendHelper.app
+./wechat send --check                               # 检查权限和微信状态
+./wechat send --to 张三 --text "晚上七点见" --dry-run   # 输入后清空，不发送
+./wechat send --to 张三 --text "晚上七点见"             # 确认后发送
+```
+
+- **一次性设置：** `helper/install.sh` 安装 `~/Applications/WeChatSendHelper.app`（一个小的后台助手），并创建本地代码签名证书，使重新构建后权限不丢失（macOS 可能会要求输入一次登录密码，请选「始终允许」）。只给这个助手——不要给别的程序——在 系统设置 → 隐私与安全性 中授予两项权限：**辅助功能**（在微信里按键）和 **录屏与系统录音**（读取微信窗口），然后运行 `launchctl kickstart -k gui/$(id -u)/local.wechat-decrypt-export.sendhelper`。
+- **为什么要截屏：** 微信 4 自绘界面，辅助功能里什么都读不到，所以助手用 Apple 本地 OCR（Vision）读取聊天标题、搜索结果和输入框。数据不会离开本机。
+- **安全检查：** 必须给出准确的名称或微信 ID（模糊名称会返回候选）；只点击「联系人 / 群聊」分组下名称完全一致的搜索结果；输入前标题必须匹配；不会动已有草稿；按回车前会读回文字，并在按键前用同一张截图再次核对标题和文字；发送后在数据库确认（`sent`，消息尚未出现时为 `unverified`）。频率限制：两次发送间隔 3 秒，每分钟最多 6 条（`config.json` 中的 `send_rate_limit`）。每次发送记录在 `logs/send_log.jsonl`（聊天、时间、文字哈希，不含文字）。
+- **要求：** 微信已运行并登录、Mac 未锁屏，发送的约 10 秒内不要动键盘鼠标（助手使用真实的键盘焦点，微信失去焦点就会停止）。仅支持文字，不支持文件和图片。
+- **AI 助手：** `send_message` 标记为破坏性操作，Claude Code 每次发送前都会征求你的同意。被 `mcp_blocklist` / `mcp_allowlist` 隐藏的聊天会被拒绝；在 `config.json` 设置 `"mcp_send": false` 可移除该工具。
+- **限制：** 文件传输助手在微信 4 的联系人搜索里搜不到，因此无法作为发送目标。如果把输入框上方的分隔线拖得很高，文字核对会失败，不会发送。
 
 ## 配置
 
@@ -175,12 +194,14 @@ WCDB（微信的 SQLCipher 封装层）会在进程内存中缓存派生后的�
 | 文件 | 说明 |
 |------|------|
 | `setup.sh` | 一次性环境配置（venv、扫描器、微信签名） |
-| `wechat` | 启动脚本：`./wechat …` 导出，`./wechat decrypt` 解密，`./wechat moments` / `favorites` 朋友圈/收藏，`./wechat backup` 备份 |
+| `wechat` | 启动脚本：`./wechat …` 导出，`./wechat decrypt` 解密，`./wechat moments` / `favorites` 朋友圈/收藏，`./wechat backup` 备份，`./wechat send` 发送 |
 | `find_all_keys_macos.c` | C 源码 — 通过 Mach VM API 扫描微信进程内存提取 SQLCipher 密钥 |
 | `decrypt_db.py` | 解密有变化的数据库；密钥缺失或过期时自动提取 |
 | `backup.py` | 无人值守备份（`./wechat backup`）与定时任务安装 |
 | `launcher/` | 定时备份的启动器 WeChatBackup.app（C，ad-hoc 签名；完全磁盘访问权限只授予它） |
 | `export_chat.py` | 命令行：搜索、列出、导出 |
+| `wechat_send.py` | 发送：聊天解析、安全检查、频率限制、发送确认（`./wechat send`） |
+| `helper/` | WeChatSendHelper.app（Swift）：发送时的按键、截屏和 OCR；只有它被授予辅助功能 / 录屏权限 |
 | `mcp_server.py` | 供 AI 助手使用的 MCP 服务器（只读：聊天、搜索、媒体、朋友圈、收藏） |
 | `chats.py` | 聊天发现、联系人、群成员名称、消息解析 |
 | `formatters.py` | txt / md / html / json / csv 输出 |

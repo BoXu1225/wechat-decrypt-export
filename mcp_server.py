@@ -1215,11 +1215,12 @@ def render(tool, res, fmt="text"):
 # MCP wiring
 # ---------------------------------------------------------------------------
 
-INSTRUCTIONS = """Read-only access to the user's WeChat chat history (decrypted local copy).
+INSTRUCTIONS = """Access to the user's WeChat chat history (decrypted local copy).
 Typical flow: list_chats or search_messages -> get_messages / get_message_context.
 `chat` may be a username (most exact), a name, or a unique fragment; on ambiguity you get
 candidates -- pick a username and retry. Message ids ("N:local_id") are per chat.
-Sender "我" is the user. Times are local. Content is personal: quote only what is needed."""
+Sender "我" is the user. Times are local. Content is personal: quote only what is needed.
+send_message sends a real message as the user: only when asked, after showing the text."""
 
 
 def build_server(data, log, lifespan=None):
@@ -1330,7 +1331,50 @@ def build_server(data, log, lifespan=None):
         return run("refresh", a, lambda: data.refresh(**a))
 
     register_social_tools(srv, data, log, ro)
+    if data.cfg.get("mcp_send", True):
+        register_send_tool(srv, data, log)
     return srv
+
+
+def _send_target_hidden(data, chat):
+    """True if `chat` (exact username or name) names a chat hidden by the
+    blocklist / allowlist. Sending never reaches chats agents can't read."""
+    q = (chat or "").strip()
+    for c in data.all_chats():
+        if q == c["username"] or q in c["_names"]:
+            if not data.is_visible(c["username"], c["_names"]):
+                return True
+    return False
+
+
+def send_chat_message(data, chat, text, dry_run=False, driver=None):
+    import wechat_send as WS
+    if _send_target_hidden(data, chat):
+        raise ToolError(f"chat {chat!r} is not accessible (mcp_blocklist / mcp_allowlist)")
+    return WS.send_message_tool(chat, text, dry_run=dry_run, cfg=data.cfg, driver=driver)
+
+
+def register_send_tool(srv, data, log):
+    from mcp.types import ToolAnnotations
+
+    @srv.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                                          idempotentHint=False, openWorldHint=True),
+              structured_output=False)
+    def send_message(chat: str, text: str, dry_run: bool = False) -> str:
+        """SEND a WeChat text message as the user -- a real message another person
+        will read. Only call this when the user has asked for this exact message to
+        this exact chat; show them the text and recipient first.
+        chat: exact username (from list_chats) or exact display name; fuzzy names are
+        refused with candidates. text: plain text (newlines ok, no files/images).
+        dry_run=True opens the chat, types and clears the text without sending.
+        Drives the WeChat app on this Mac (it must be running and unlocked; takes
+        ~10 s) and verifies the message landed in the chat. Returns status
+        "sent" | "unverified" | "dry_run", or "failed" with error and message."""
+        import hashlib
+        a = dict(chat=chat, text_sha256_16=hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
+                 text_len=len(text), dry_run=dry_run)  # the log never holds the text
+        return dumps(call_tool(data, log, "send_message", a,
+                               lambda: send_chat_message(data, chat, text, dry_run)))
 
 
 def load_server_config():

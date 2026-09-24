@@ -674,7 +674,7 @@ _HELPER_TIMEOUTS = {
     "escape": 5, "chat_title": 8, "input_text": 6, "paste_input": 8,
     "clear_input": 6, "send": 8, "probe": 32,
     "v_ocr": 12, "v_open_search": 8, "v_search_enter": 12, "v_paste": 8, "v_clear": 7,
-    "v_send": 27,
+    "v_send": 27, "v_click_popup": 10,
 }
 
 _HELPER_ERRORS = {
