@@ -24,7 +24,7 @@ import Foundation
 import ScreenCaptureKit
 import Vision
 
-let helperVersion = "8"
+let helperVersion = "10"
 let wechatBundleID = "com.tencent.xinWeChat"
 
 // MARK: - Errors / JSON
@@ -149,6 +149,7 @@ final class Driver {
     var pid: pid_t = 0
     var app: AXUIElement?
     var searchArmed = false
+    var menuArmed = false
     var sessionStart: Date?
     var ownEvents: [Date] = []
     let banner = Banner()
@@ -250,13 +251,14 @@ final class Driver {
         }
     }
 
-    func click(_ rect: CGRect) {
+    func click(_ rect: CGRect, right: Bool = false) {
         let saved = CGEvent(source: nil)?.location
         let pt = CGPoint(x: rect.midX, y: rect.midY)
-        for type in [CGEventType.leftMouseDown, .leftMouseUp] {
+        let types: [CGEventType] = right ? [.rightMouseDown, .rightMouseUp] : [.leftMouseDown, .leftMouseUp]
+        for type in types {
             noteOwnEvent()
             CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: pt,
-                    mouseButton: .left)?.post(tap: .cghidEventTap)
+                    mouseButton: right ? .right : .left)?.post(tap: .cghidEventTap)
             sleepMs(40)
         }
         if let saved = saved { CGWarpMouseCursorPosition(saved) }
@@ -670,6 +672,8 @@ final class Driver {
         case "v_open_search": return try vOpenSearch(req)
         case "v_search_enter": return try vSearchEnter(req)
         case "v_click_popup": return try vClickPopup(req)
+        case "v_right_click": return try vRightClick(req)
+        case "v_click": return try vClick(req)
         case "v_paste": return try vPaste(req)
         case "v_clear": return try vClear(req)
         case "v_send": return try vSend(req)
@@ -683,7 +687,7 @@ let opTimeouts: [String: Double] = [
     "open_search": 6, "search_results": 6, "click_result": 6, "search_enter": 4,
     "escape": 3, "chat_title": 6, "input_text": 4, "paste_input": 6,
     "clear_input": 4, "send": 6, "probe": 30,
-    "v_ocr": 10, "v_open_search": 6, "v_search_enter": 10, "v_paste": 6, "v_clear": 5, "v_click_popup": 8, "idle": 2, "session_begin": 3, "session_end": 3,
+    "v_ocr": 10, "v_open_search": 6, "v_search_enter": 10, "v_paste": 6, "v_clear": 5, "v_click_popup": 10, "v_right_click": 5, "v_click": 5, "idle": 2, "session_begin": 3, "session_end": 3,
     "v_send": 25,
 ]
 
@@ -1094,7 +1098,10 @@ extension Driver {
                 if t.isEmpty { break }
             }
             return t
-        }.filter { !$0.isEmpty }.joined(separator: "\n")
+        }.filter { line in
+            // A line that is only the blinking text cursor is not text.
+            !line.isEmpty && !line.unicodeScalars.allSatisfy { caret.contains($0) || $0 == " " }
+        }.joined(separator: "\n")
     }
 
     func rectArg(_ req: JSON, _ key: String) throws -> CGRect {
@@ -1181,12 +1188,46 @@ extension Driver {
         return [:]
     }
 
-    /// Click a point (popup-relative) inside WeChat's search results popup;
-    /// only valid right after v_open_search.
+    /// Right-click a message bubble to open its context menu. The point must
+    /// be in the message area: below the title band, above the input box.
+    func vRightClick(_ req: JSON) throws -> JSON {
+        let p = try pointArg(req)
+        try requireFront()
+        searchArmed = false
+        menuArmed = false
+        let wf = try windowOrigin()
+        guard p.x > wf.width * 0.15, p.x < wf.width - 4, p.y > 70, p.y < wf.height * 0.8 else {
+            throw OpError("bad_request", "point must be inside the message area")
+        }
+        click(CGRect(x: wf.minX + p.x - 1, y: wf.minY + p.y - 1, width: 2, height: 2), right: true)
+        sleepMs(400)
+        menuArmed = true
+        return [:]
+    }
+
+    /// Click a point (popup-relative) inside WeChat's current popup: the
+    /// search results (after v_open_search) or a context menu (after
+    /// v_right_click). For a context menu the caller must pass `expect`, and
+    /// the OCR text at that point must be exactly it -- so e.g. "Recall" or
+    /// "Delete" can never be clicked by mistake.
     func vClickPopup(_ req: JSON) throws -> JSON {
         let p = try pointArg(req)
-        guard searchArmed else { throw OpError("no_search", "call v_open_search first") }
+        guard searchArmed || menuArmed else { throw OpError("no_search", "call v_open_search first") }
+        let isMenu = menuArmed
         searchArmed = false
+        menuArmed = false
+        if isMenu {
+            let expect = try str(req, "expect")
+            let allowed: Set<String> = ["Quote", "引用"]
+            guard allowed.contains(expect) else {
+                throw OpError("bad_request", "only the Quote menu item may be clicked")
+            }
+            let hit = try ocr(nil, popup: true).items.first { $0.rect.insetBy(dx: -4, dy: -4).contains(p) }
+            guard let h = hit, h.text.trimmingCharacters(in: .whitespaces) == expect else {
+                key(.escape)
+                throw OpError("precondition_failed", "the menu item at that point is not \(expect)")
+            }
+        }
         try requireFront()
         let (_, frame, _) = try captureFrame(popup: true)
         guard p.x > 0, p.y > 0, p.x < frame.width, p.y < frame.height else {
@@ -1207,6 +1248,16 @@ extension Driver {
             key(.v, cmd: true)
             sleepMs(400)
         }
+        return [:]
+    }
+
+    /// Plain click in the lower half of the window (e.g. the close button of
+    /// a quote attached to the input box).
+    func vClick(_ req: JSON) throws -> JSON {
+        try requireFront()
+        searchArmed = false
+        menuArmed = false
+        try clickLower(try pointArg(req))
         return [:]
     }
 

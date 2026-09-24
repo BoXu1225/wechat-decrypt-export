@@ -924,6 +924,82 @@ class VisionDriverTests(unittest.TestCase):
         self.assertEqual(forced[0]["expected_input"], "hello there, this is a test")
         self.assertEqual(c.input, "")
 
+    def test_bubble_and_chip_matching(self):
+        V = W.VisionDriver
+        self.assertTrue(V._bubble_match("明天一起吃饭", "明天一起吃饭"))
+        self.assertTrue(V._bubble_match("a long first line", "a long first line that wraps"))
+        self.assertFalse(V._bubble_match("明天", "明天一起吃饭"))       # too short a prefix
+        self.assertFalse(V._bubble_match("今天不行", "明天一起吃饭"))
+        q = {"text": "明天一起吃饭", "sender": "张三", "is_self": False}
+        self.assertTrue(V._chip_matches("张三：明天一起吃饭", q))    # full-width colon
+        self.assertTrue(V._chip_matches("张三: 明天一起吃饭看…", dict(q, text="明天一起吃饭看看吧")))
+        self.assertFalse(V._chip_matches("别人：明天一起吃饭", q))      # wrong sender
+        self.assertFalse(V._chip_matches("张三：今天不行", q))
+        self.assertFalse(V._chip_matches("明天一起吃饭", q))            # no sender part
+        self.assertTrue(V._chip_matches("李四：hello there", {"text": "hello there",
+                                                              "sender": "我", "is_self": True}))
+
+    def test_quote_flow(self):
+        d, c = self.driver()
+        quote = {"id": "0:5", "text": "see you at seven", "sender": "Alice", "is_self": False}
+        menu = [{"text": "Copy", "x": 36, "y": 36, "w": 35, "h": 16},
+                {"text": "Quote", "x": 36, "y": 282, "w": 40, "h": 11},
+                {"text": "Delete", "x": 36, "y": 319, "w": 45, "h": 13}]
+        bubble = {"text": "see you at seven", "x": 380, "y": 527, "w": 120, "h": 17}
+        state = {"menu": False}
+        real_call = c.call
+        base_items = c._window_items
+
+        def items():
+            return base_items() + [bubble]
+        c._window_items = items
+
+        def call(op, **a):
+            if op == "v_right_click":
+                c.calls.append((op, a))
+                state["menu"] = True
+                return {}
+            if op == "v_ocr" and a.get("popup") and state["menu"]:
+                c.calls.append((op, a))
+                return {"window": [184, 368], "items": menu, "text": ""}
+            if op == "v_click_popup" and state["menu"]:
+                c.calls.append((op, a))
+                state["menu"] = False
+                c.input = "Alice：see you at seven"
+                return {}
+            if op == "v_paste":
+                c.calls.append((op, a))
+                c.input = a["text"] + "\n" + "Alice：see you at seven"
+                return {}
+            if op == "v_click":
+                c.calls.append((op, a))
+                c.input = c.input.replace("Alice：see you at seven", "").strip()
+                return {}
+            return real_call(op, **a)
+        c.call = call
+        tok = d.prepare()
+        d.open_chat("Alice", ["Alice"])
+        d.attach_quote(quote)
+        clicked = [a for op, a in c.calls if op == "v_click_popup" and "expect" in a]
+        self.assertEqual(clicked[0]["expect"], "Quote")
+        self.assertEqual(clicked[0]["y"], 287)
+        d.paste_into_input("sounds good")
+        self.assertTrue(d.input_matches(d.input_text(), "sounds good"))
+        self.assertFalse(d.input_matches("sounds good", "sounds good"))  # chip missing
+        d.clear_input()
+        d.remove_quote()
+        self.assertEqual(c.input, "")
+        d.restore(tok)
+
+    def test_quote_target_must_be_on_the_right_side(self):
+        d, c = self.driver()
+        d.prepare()
+        d.open_chat("Alice", ["Alice"])
+        # "hi there" is on the left (theirs); quoting it as our own must fail
+        with self.assertRaises(W.UIError):
+            d.attach_quote({"text": "hi there", "sender": "我", "is_self": True})
+        self.assertNotIn("v_right_click", [op for op, _ in c.calls])
+
     def test_helper_activity_codes_map_to_user_activity(self):
         for code in ("user_activity", "not_frontmost"):
             self.assertIsInstance(W._HELPER_ERRORS[code]("x"), W.UserActivity)

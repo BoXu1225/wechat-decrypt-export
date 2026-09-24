@@ -1347,26 +1347,32 @@ def _send_target_hidden(data, chat):
     return False
 
 
-def send_chat_message(data, chat, text, dry_run=False, driver=None):
+def send_chat_message(data, chat, text, dry_run=False, driver=None, quote=None):
     import wechat_send as WS
     if _send_target_hidden(data, chat):
         raise ToolError(f"chat {chat!r} is not accessible (mcp_blocklist / mcp_allowlist)")
-    return WS.send_message_tool(chat, text, dry_run=dry_run, cfg=data.cfg, driver=driver)
+    return WS.send_message_tool(chat, text, dry_run=dry_run, cfg=data.cfg, driver=driver,
+                                quote=quote)
 
 
 def register_send_tool(srv, data, log):
+    from typing import Optional
     from mcp.types import ToolAnnotations
 
     @srv.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
                                           idempotentHint=False, openWorldHint=True),
               structured_output=False)
-    def send_message(chat: str, text: str, dry_run: bool = False) -> str:
+    def send_message(chat: str, text: str, dry_run: bool = False,
+                     quote: Optional[str] = None) -> str:
         """SEND a WeChat text message as the user -- a real message another person
         will read. Only call this when the user has asked for this exact message to
         this exact chat; show them the text and recipient first.
         chat: exact username (from list_chats) or exact display name; fuzzy names are
         refused with candidates. text: plain text (newlines ok, no files/images).
         dry_run=True opens the chat, types and clears the text without sending.
+        quote: id ("N:local_id", from get_messages / search_messages / get_message_context)
+        of a text message in this chat to reply to as a WeChat quote (引用); it must
+        still be visible in the chat window, i.e. among the most recent messages.
         Drives the WeChat app on this Mac (it must be running and unlocked; takes
         ~10 s) and verifies the message landed in the chat. It first waits (up to
         30 s) until the user stops using the keyboard/mouse, and shows an on-screen
@@ -1377,9 +1383,10 @@ def register_send_tool(srv, data, log):
         keyboard; if "draft_left" is set, the text is still typed in that chat."""
         import hashlib
         a = dict(chat=chat, text_sha256_16=hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
-                 text_len=len(text), dry_run=dry_run)  # the log never holds the text
+                 text_len=len(text), dry_run=dry_run, quote=quote)  # never the text
         return dumps(call_tool(data, log, "send_message", a,
-                               lambda: send_chat_message(data, chat, text, dry_run)))
+                               lambda: send_chat_message(data, chat, text, dry_run,
+                                                         quote=quote)))
 
 
 def load_server_config():
