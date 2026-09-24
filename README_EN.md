@@ -110,7 +110,7 @@ Both take `-f html|md|json|txt` (default html), `--since` / `--until`, `--images
 
 ## AI agents (MCP server)
 
-`mcp_server.py` lets MCP clients such as Claude Code or Claude Desktop read your chats. Decrypt once first (`./wechat decrypt`), then register it:
+`mcp_server.py` lets MCP clients such as Claude Code or Claude Desktop read your chats (and, with your approval each time, send messages). Decrypt once first (`./wechat decrypt`), then register it:
 
 ```bash
 claude mcp add --scope user wechat -- "$PWD/venv/bin/python" "$PWD/mcp_server.py"
@@ -135,13 +135,32 @@ Then ask things like "what did 张三 and I decide about the trip last week?" or
 | `get_moments` | Locally cached Moments posts, by author, time or text |
 | `search_favorites` / `get_favorite` | Search and read Favorites |
 | `refresh` | Re-decrypt changed databases now |
+| `send_message` | Send a text message (asks you first; see [Sending messages](#sending-messages)) |
 
-- **Read-only.** Every tool except `refresh` is marked read-only; nothing is sent or changed in WeChat.
+- **Read-only except `send_message`.** All reading tools are marked read-only; `send_message` is marked destructive, so clients ask before each send.
 - **Access:** all chats are visible by default. To hide some, add `"mcp_blocklist": ["name or wxid", …]` to `config.json`; a non-empty `"mcp_allowlist"` shows only the chats listed. Every call is logged to `logs/mcp_access.jsonl` (tool, arguments, result count — no message content).
 - **Freshness:** before reads the server re-decrypts changed databases with the existing keys, at most every `mcp_auto_refresh_minutes` (default 5, `0` disables). It never runs the key scanner; if keys are stale it tells you to run `./wechat decrypt`. The newest messages can lag a little because WeChat holds recent writes in its WAL until it checkpoints.
 - **Compact output:** results are plain lines — `HH:MM sender: text` under a date line, the chat named once — about 60–70% smaller than JSON, so agents can read long histories. Set `"mcp_output": "json"` in `config.json` for JSON objects instead.
 - **Search index:** built on first use at `decrypted/mcp_index.db` (a few seconds for ~200k messages) and updated incrementally.
 - **Check:** `./venv/bin/python mcp_server.py --selftest` prints counts (no message content) and exits.
+
+## Sending messages
+
+`./wechat send` (and the MCP tool `send_message`) sends a text message by driving the WeChat app on this Mac, the way you would: search the chat, check it opened the right one, paste, check the text, press Enter, then confirm the message landed in the database.
+
+```bash
+helper/install.sh                                   # once: builds and starts WeChatSendHelper.app
+./wechat send --check                               # permissions / WeChat state
+./wechat send --to 张三 --text "晚上七点见" --dry-run   # types and clears, sends nothing
+./wechat send --to 张三 --text "晚上七点见"             # asks for confirmation, then sends
+```
+
+- **Setup (once):** `helper/install.sh` installs `~/Applications/WeChatSendHelper.app`, a small background helper, and a local code-signing certificate so rebuilds keep their permissions (macOS may ask once for your login password: choose *Always Allow*). Grant the helper — and nothing else — two permissions in System Settings → Privacy & Security: **Accessibility** (to press keys in WeChat) and **Screen & System Audio Recording** (to read WeChat's window), then run `launchctl kickstart -k gui/$(id -u)/local.wechat-decrypt-export.sendhelper`.
+- **Why screenshots:** WeChat 4 draws its own UI and exposes nothing to Accessibility, so the helper reads the chat title, search results and input box with Apple's on-device OCR (Vision). Nothing leaves the Mac.
+- **Safety checks:** the chat must be given by exact name or username (fuzzy names return candidates); only a search result with exactly that name under *Contacts* / *Group Chats* is clicked; the title must match before anything is typed; an existing draft is never touched; the text is read back before Enter, and the title and text are re-checked in the same screenshot right before the key press; afterwards the database is checked (`sent`, or `unverified` if the message hasn't appeared yet). Rate limit: 3 s between sends, 6 per minute (`send_rate_limit` in `config.json`). Every send is logged to `logs/send_log.jsonl` (chat, time, text hash — not the text).
+- **Requirements:** WeChat running and logged in, the Mac unlocked, and hands off the keyboard and mouse for the ~10 s a send takes (the helper uses the real keyboard focus and stops if WeChat loses focus). Text only — no files or images.
+- **Agents:** `send_message` is marked destructive, so Claude Code asks you before every send. It refuses chats hidden by `mcp_blocklist` / `mcp_allowlist`; set `"mcp_send": false` in `config.json` to remove the tool.
+- **Limits:** File Transfer (文件传输助手) doesn't appear in WeChat 4's contact search, so it can't be a target. If you drag the divider above the input box much higher, the text check fails and nothing is sent.
 
 ## Configuration
 
@@ -175,12 +194,14 @@ Each chat's messages live in tables named `Msg_<md5(username)>`; message content
 | File | Purpose |
 |------|---------|
 | `setup.sh` | One-time environment setup (venv, scanner, WeChat signing) |
-| `wechat` | Launcher: `./wechat …` → export, `./wechat decrypt` → decrypt, `./wechat moments` / `favorites` → Moments / Favorites, `./wechat backup` → backup |
+| `wechat` | Launcher: `./wechat …` → export, `./wechat decrypt` → decrypt, `./wechat moments` / `favorites` → Moments / Favorites, `./wechat backup` → backup, `./wechat send` → send |
 | `find_all_keys_macos.c` | C — scans WeChat process memory for SQLCipher keys (Mach VM API) |
 | `decrypt_db.py` | Decrypts changed databases; extracts keys automatically when missing or stale |
 | `backup.py` | Unattended backup (`./wechat backup`) and LaunchAgent install |
 | `launcher/` | WeChatBackup.app, the backup job's launcher (C, ad-hoc signed; the only thing granted Full Disk Access) |
 | `export_chat.py` | Command line: search, list, export |
+| `wechat_send.py` | Sending: chat resolution, safety checks, rate limit, verification (`./wechat send`) |
+| `helper/` | WeChatSendHelper.app (Swift): keyboard, screenshots and OCR for sending; the only app granted Accessibility / Screen Recording |
 | `mcp_server.py` | MCP server for AI agents (read-only chat, search, media, Moments, Favorites) |
 | `chats.py` | Chat discovery, contacts, group sender names, message parsing |
 | `formatters.py` | txt / md / html / json / csv writers |

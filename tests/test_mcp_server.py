@@ -345,6 +345,45 @@ class PolicyTest(Base):
         self.assertEqual(d.resolve_chat("e")["username"], ROOM)
         d._index.close()
 
+    def test_send_refused_for_hidden_chat(self):
+        d = make_data(self.tmp, mcp_blocklist=["Alice R"])
+        for target in (ALICE, "Alice R"):
+            err = self.err(M.send_chat_message, d, target, "hi", driver=object())
+            self.assertIn("not accessible", err["error"])
+
+    def test_send_tool_registered_destructive_and_log_has_no_text(self):
+        try:
+            from mcp import Client
+        except ImportError:
+            self.skipTest("mcp 2.x client not available")
+        import anyio
+        import wechat_send as WS
+        log_path = os.path.join(self.tmp, "logs", "a.jsonl")
+        d = make_data(self.tmp)
+        sent = []
+        orig = WS.send_message_tool
+        WS.send_message_tool = lambda chat, text, **kw: sent.append((chat, text)) or {
+            "status": "sent", "chat": {"username": chat}}
+        try:
+            async def go():
+                async with Client(M.build_server(d, M.AccessLog(log_path))) as client:
+                    tools = {t.name: t for t in (await client.list_tools()).tools}
+                    ann = tools["send_message"].annotations
+                    self.assertTrue(ann.destructive_hint)
+                    self.assertFalse(ann.read_only_hint)
+                    r = await client.call_tool("send_message",
+                                               {"chat": ALICE, "text": "secret words"})
+                    self.assertEqual(json.loads(r.content[0].text).get("status"), "sent", r.content[0].text)
+            anyio.run(go)
+        finally:
+            WS.send_message_tool = orig
+        self.assertEqual(sent, [(ALICE, "secret words")])
+        with open(log_path, encoding="utf-8") as f:
+            raw = f.read()
+        self.assertIn("send_message", raw)
+        self.assertNotIn("secret words", raw)
+        self.assertNotIn("send_message", {t for t in _tool_names(make_data(self.tmp, mcp_send=False))})
+
     def test_blocklist_by_username_hides_shared_group(self):
         d = make_data(self.tmp, mcp_blocklist=[ROOM])
         self.assertEqual(d.get_contact("Bobby")["shared_groups"], [])
@@ -578,6 +617,18 @@ class RefreshTest(unittest.TestCase):
         d = M.WeChatData({"decrypted_dir": self.out, "mcp_auto_refresh_minutes": 0})
         self.assertIsNone(d.maybe_auto_refresh())
 
+
+
+def _tool_names(data):
+    import anyio
+    names = []
+
+    async def go():
+        from mcp import Client
+        async with Client(M.build_server(data, M.AccessLog(os.devnull))) as client:
+            names.extend(t.name for t in (await client.list_tools()).tools)
+    anyio.run(go)
+    return names
 
 if __name__ == "__main__":
     unittest.main()

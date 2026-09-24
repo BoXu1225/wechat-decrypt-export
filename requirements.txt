@@ -2,3 +2,7 @@ pycryptodome
 zstandard
 mcp>=1.30
 silk-python
+# Only for wechat_send.py "send_driver": "direct" (the default helper app needs none)
+pyobjc-framework-ApplicationServices; sys_platform == "darwin"
+pyobjc-framework-Quartz; sys_platform == "darwin"
+pyobjc-framework-Cocoa; sys_platform == "darwin"

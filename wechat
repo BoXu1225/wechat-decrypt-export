@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # wechat - run export_chat.py (or `wechat decrypt` -> decrypt_db.py, `wechat backup` -> backup.py,
-# `wechat moments` / `wechat favorites` -> moments.py / favorites.py) with the repo's venv,
+# `wechat moments` / `wechat favorites` -> moments.py / favorites.py, `wechat send` ->
+# wechat_send.py) with the repo's venv,
 # from any directory. Can be symlinked into e.g. ~/bin.
 set -euo pipefail
 
@@ -28,5 +29,6 @@ if [[ "${1:-}" == "decrypt" ]]; then
 fi
 case "${1:-}" in
     moments|favorites) mod="$1"; shift; exec "$PY" "$ROOT/$mod.py" "$@" ;;
+    send) shift; exec "$PY" "$ROOT/wechat_send.py" "$@" ;;
 esac
 exec "$PY" "$ROOT/export_chat.py" "$@"
