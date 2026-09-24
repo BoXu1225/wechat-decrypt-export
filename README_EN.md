@@ -108,6 +108,40 @@ Both take `-f html|md|json|txt` (default html), `--since` / `--until`, `--images
 - **Moments** (`sns/sns.db`) holds only posts WeChat has loaded on this Mac — your own and friends' posts you scrolled past — with text, links, location, likes and comments (names resolved through your contacts). Photos and videos are exported only when they are in WeChat's local cache (`cache/<month>/Sns/`); CDN URLs are kept in JSON but never downloaded.
 - **Favorites** (`favorite/favorite.db`): text, links, images, files, chat records, notes, locations, with source chat/sender and tags. Only files WeChat has saved locally can be exported.
 
+## AI agents (MCP server)
+
+`mcp_server.py` lets MCP clients such as Claude Code or Claude Desktop read your chats. Decrypt once first (`./wechat decrypt`), then register it:
+
+```bash
+claude mcp add --scope user wechat -- "$PWD/venv/bin/python" "$PWD/mcp_server.py"
+```
+
+Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+
+```json
+{"mcpServers": {"wechat": {"command": "/ABS/PATH/venv/bin/python", "args": ["/ABS/PATH/mcp_server.py"]}}}
+```
+
+Then ask things like "what did 张三 and I decide about the trip last week?" or "find the address someone sent in the family group".
+
+| Tool | What it does |
+|------|--------------|
+| `list_chats` | Chats with names, type and last activity; filter by name, single/group |
+| `get_messages` | Messages of one chat, by time range or cursor, oldest or newest first |
+| `search_messages` | Full-text search (Chinese works) across all chats or one chat, by sender and time |
+| `get_message_context` | Messages around a message id or a time |
+| `get_contact` | Remark, nickname, alias and shared groups of a person or group |
+| `get_image` / `get_voice` | A chat image (as an image) or voice message (as audio) |
+| `get_moments` | Locally cached Moments posts, by author, time or text |
+| `search_favorites` / `get_favorite` | Search and read Favorites |
+| `refresh` | Re-decrypt changed databases now |
+
+- **Read-only.** Every tool except `refresh` is marked read-only; nothing is sent or changed in WeChat.
+- **Access:** all chats are visible by default. To hide some, add `"mcp_blocklist": ["name or wxid", …]` to `config.json`; a non-empty `"mcp_allowlist"` shows only the chats listed. Every call is logged to `logs/mcp_access.jsonl` (tool, arguments, result count — no message content).
+- **Freshness:** before reads the server re-decrypts changed databases with the existing keys, at most every `mcp_auto_refresh_minutes` (default 5, `0` disables). It never runs the key scanner; if keys are stale it tells you to run `./wechat decrypt`. The newest messages can lag a little because WeChat holds recent writes in its WAL until it checkpoints.
+- **Search index:** built on first use at `decrypted/mcp_index.db` (a few seconds for ~200k messages) and updated incrementally.
+- **Check:** `./venv/bin/python mcp_server.py --selftest` prints counts (no message content) and exits.
+
 ## Configuration
 
 Nothing to configure: on first run the WeChat data folder is auto-detected and saved to `config.json` (you pick one if there are several accounts), and your own WeChat ID is derived from the folder name. To override, edit `config.json`:
@@ -146,6 +180,7 @@ Each chat's messages live in tables named `Msg_<md5(username)>`; message content
 | `backup.py` | Unattended backup (`./wechat backup`) and LaunchAgent install |
 | `launcher/` | WeChatBackup.app, the backup job's launcher (C, ad-hoc signed; the only thing granted Full Disk Access) |
 | `export_chat.py` | Command line: search, list, export |
+| `mcp_server.py` | MCP server for AI agents (read-only chat, search, media, Moments, Favorites) |
 | `chats.py` | Chat discovery, contacts, group sender names, message parsing |
 | `formatters.py` | txt / md / html / json / csv writers |
 | `moments.py`, `favorites.py`, `social_common.py` | Moments / Favorites parsing, media lookup and export |
