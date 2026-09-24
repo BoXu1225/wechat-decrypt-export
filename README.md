@@ -108,6 +108,40 @@
 - **朋友圈**（`sns/sns.db`）只包含本机微信加载过的动态（自己的和刷到过的好友动态），含文字、链接、位置、点赞和评论（按通讯录显示名称）。图片/视频只有在微信本地缓存（`cache/<月份>/Sns/`）中时才能导出；CDN 链接保留在 JSON 中，不会联网下载。
 - **收藏**（`favorite/favorite.db`）：文字、链接、图片、文件、聊天记录、笔记、位置等，含来源聊天/发送者和标签。只有微信已保存在本地的文件能导出。
 
+## AI 助手（MCP 服务器）
+
+`mcp_server.py` 让 Claude Code、Claude Desktop 等 MCP 客户端读取你的聊天记录。先解密一次（`./wechat decrypt`），然后注册：
+
+```bash
+claude mcp add --scope user wechat -- "$PWD/venv/bin/python" "$PWD/mcp_server.py"
+```
+
+Claude Desktop（`~/Library/Application Support/Claude/claude_desktop_config.json`）：
+
+```json
+{"mcpServers": {"wechat": {"command": "/绝对路径/venv/bin/python", "args": ["/绝对路径/mcp_server.py"]}}}
+```
+
+然后就可以问："上周我和张三关于旅行最后怎么定的？"、"找一下家庭群里有人发过的那个地址"。
+
+| 工具 | 功能 |
+|------|------|
+| `list_chats` | 聊天列表（名称、类型、最近活动），可按名称、单聊/群聊过滤 |
+| `get_messages` | 某个聊天的消息，按时间范围或游标分页，正序或倒序 |
+| `search_messages` | 全文搜索（支持中文），可限定聊天、发送者和时间 |
+| `get_message_context` | 某条消息或某个时间点前后的消息 |
+| `get_contact` | 联系人或群的备注、昵称、微信号和共同群聊 |
+| `get_image` / `get_voice` | 聊天图片（以图片返回）或语音（以音频返回） |
+| `get_moments` | 本地缓存的朋友圈，可按作者、时间、内容筛选 |
+| `search_favorites` / `get_favorite` | 搜索和读取收藏 |
+| `refresh` | 立即重新解密有变化的数据库 |
+
+- **只读。** 除 `refresh` 外所有工具都标记为只读，不会在微信里发送或修改任何东西。
+- **访问范围：** 默认所有聊天可见。要隐藏某些聊天，在 `config.json` 中加 `"mcp_blocklist": ["名称或 wxid", …]`；`"mcp_allowlist"` 非空时只显示列出的聊天。每次调用都记录在 `logs/mcp_access.jsonl`（工具、参数、结果数量，不含消息内容）。
+- **数据新鲜度：** 读取前会用已有密钥重新解密有变化的数据库，最多每 `mcp_auto_refresh_minutes` 分钟一次（默认 5，`0` 关闭）。它不会运行密钥扫描器；密钥过期时会提示你运行 `./wechat decrypt`。微信会把最新写入暂存在 WAL 中，最新消息可能略有延迟。
+- **搜索索引：** 首次使用时在 `decrypted/mcp_index.db` 建立（约 20 万条消息需几秒），之后增量更新。
+- **自检：** `./venv/bin/python mcp_server.py --selftest` 输出统计数字（不含消息内容）后退出。
+
 ## 配置
 
 无需配置：首次运行时会自动检测微信数据目录并保存到 `config.json`（有多个账号时让你选择），你自己的微信 ID 从目录名自动推导。如需手动指定，编辑 `config.json`：
@@ -146,6 +180,7 @@ WCDB（微信的 SQLCipher 封装层）会在进程内存中缓存派生后的�
 | `backup.py` | 无人值守备份（`./wechat backup`）与定时任务安装 |
 | `launcher/` | 定时备份的启动器 WeChatBackup.app（C，ad-hoc 签名；完全磁盘访问权限只授予它） |
 | `export_chat.py` | 命令行：搜索、列出、导出 |
+| `mcp_server.py` | 供 AI 助手使用的 MCP 服务器（只读：聊天、搜索、媒体、朋友圈、收藏） |
 | `chats.py` | 聊天发现、联系人、群成员名称、消息解析 |
 | `formatters.py` | txt / md / html / json / csv 输出 |
 | `moments.py`、`favorites.py`、`social_common.py` | 朋友圈 / 收藏解析、媒体查找和导出 |
