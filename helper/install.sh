@@ -19,6 +19,9 @@ PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG_DIR="$HOME/Library/Logs/wechat-decrypt-export"
 DOMAIN="gui/$(id -u)"
 
+# A stable local signing identity keeps the permissions across rebuilds
+# (macOS may ask once for your login password: choose "Always Allow").
+"$HERE/make-cert.sh" || echo "[i] no signing identity; the helper will be signed ad-hoc"
 "$HERE/build.sh"
 
 cdhash() { codesign -dvvv "$1" 2>&1 | sed -n 's/^CDHash=//p'; }
@@ -92,16 +95,20 @@ fi
 
 cat <<MSG
 
-Next step (once): grant Accessibility to the helper
-  System Settings -> Privacy & Security -> Accessibility
-  Turn ON "WeChatSendHelper". If it is not listed, click "+", press Cmd+Shift+G,
-  enter  $DEST_APP  and add it.
-  Then check:  ./venv/bin/python wechat_send.py --check   ("trusted": true)
-
-Note: the helper is ad-hoc signed, so macOS ties the permission to this exact
-build. install.sh only replaces the app when its sources change; after such a
-rebuild, macOS may show the old entry as enabled but not honour it -- remove it
-with "-" and add the app again.
+Next step (once): grant the helper two permissions in
+System Settings -> Privacy & Security:
+  1. Accessibility                    (to press keys in WeChat)
+  2. Screen & System Audio Recording  (to read WeChat's window: WeChat 4 has no
+                                       accessibility tree, so the chat title and
+                                       message are checked by on-device OCR)
+Turn ON "WeChatSendHelper" in both. If it is not listed, click "+", press
+Cmd+Shift+G, enter  $DEST_APP  and add it. After granting Screen Recording run
+  launchctl kickstart -k $DOMAIN/$LABEL
+Then check:  ./venv/bin/python wechat_send.py --check
+  ("trusted": true, "screen_capture": true)
 MSG
-[[ $CHANGED == 1 ]] && echo "(This run installed a new build: re-check the Accessibility entry.)"
+if ! security find-certificate -c "WeChatSendHelper Local Signing" >/dev/null 2>&1; then
+    echo "Note: the helper is ad-hoc signed, so each rebuild needs the permissions again"
+    echo "(remove the old entries with \"-\" and add the app again)."
+fi
 exit 0

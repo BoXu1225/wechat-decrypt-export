@@ -724,5 +724,134 @@ class ChooseResultTests(unittest.TestCase):
         self.assertEqual(r["text"], "File Transfer")
 
 
+class FakeVisionClient:
+    """Scripted helper for VisionDriver: a 1400x868 WeChat window."""
+
+    W, H = 1400, 868
+
+    def __init__(self, title="Alice", popup=None, input_text=""):
+        self.title = title
+        self.input = input_text
+        self.popup = popup if popup is not None else [
+            {"text": "Contacts", "x": 30, "y": 10, "w": 60, "h": 10},
+            {"text": "Alice", "x": 70, "y": 30, "w": 40, "h": 14},
+        ]
+        self.calls = []
+        self.screen_capture = True
+
+    def _window_items(self):
+        items = [{"text": self.title, "x": 315, "y": 22, "w": 40, "h": 18},
+                 {"text": "Search", "x": 101, "y": 28, "w": 43, "h": 11}]
+        # chat list: names left, right-aligned times ending at x=291
+        for k in range(5):
+            items.append({"text": "name", "x": 117, "y": 80 + 70 * k, "w": 50, "h": 16})
+            items.append({"text": "12:00", "x": 262, "y": 82 + 70 * k, "w": 29, "h": 11})
+        # the other person's messages start close to the pane edge
+        items.append({"text": "hi there", "x": 360, "y": 300, "w": 150, "h": 18})
+        return items
+
+    def call(self, op, **a):
+        self.calls.append((op, a))
+        if op == "v_ocr":
+            if a.get("popup"):
+                return {"window": [368, 404], "items": self.popup, "text": ""}
+            rect = a.get("rect")
+            items = self._window_items()
+            if rect and rect[1] > self.H / 2:  # input box
+                return {"window": [self.W, self.H], "items": [], "text": self.input}
+            if rect:
+                x, y, w, h = rect
+                items = [i for i in items if x <= i["x"] < x + w and y <= i["y"] < y + h]
+            return {"window": [self.W, self.H], "items": items,
+                    "text": "\n".join(i["text"] for i in items)}
+        if op == "status":
+            return {"trusted": True, "screen_capture": self.screen_capture,
+                    "screen_locked": False, "wechat_running": True}
+        if op == "v_paste":
+            self.input = a["text"]
+        if op == "v_clear":
+            self.input = ""
+        if op == "v_send":
+            if a["expected_input"] != self.input:
+                raise W.UIError("mismatch")
+            self.input = ""
+            return {"leftover": ""}
+        return {}
+
+    def close(self):
+        pass
+
+
+class VisionDriverTests(unittest.TestCase):
+    def driver(self, **kw):
+        c = FakeVisionClient(**kw)
+        return W.VisionDriver(c, sleep=lambda s: None), c
+
+    def test_layout_finds_title_despite_messages_near_the_list(self):
+        d, _ = self.driver()
+        d._layout()
+        self.assertEqual(d.chat_title(), "Alice")
+        self.assertLess(d.title_rect[0], 315)
+        self.assertGreater(d.input_rect[1], 868 / 2)
+
+    def test_open_chat_clicks_exact_contact_row(self):
+        d, c = self.driver()
+        d.open_chat("Alice", ["Alice"])
+        click = [a for op, a in c.calls if op == "v_click_popup"]
+        self.assertEqual(click, [{"x": 90, "y": 37}])
+        self.assertNotIn("v_search_enter", [op for op, _ in c.calls])
+
+    def test_open_chat_ignores_non_chat_sections(self):
+        popup = [{"text": "Internet search results", "x": 60, "y": 19, "w": 200, "h": 12},
+                 {"text": "Alice", "x": 38, "y": 50, "w": 40, "h": 14},
+                 {"text": "Chat History", "x": 35, "y": 220, "w": 90, "h": 12},
+                 {"text": "Alice", "x": 80, "y": 257, "w": 40, "h": 14}]
+        d, c = self.driver(popup=popup)
+        with self.assertRaises(W.UIError):
+            d.open_chat("Alice", ["Alice"])
+        self.assertNotIn("v_click_popup", [op for op, _ in c.calls])
+        self.assertIn("escape", [op for op, _ in c.calls])
+
+    def test_pick_needs_exact_text(self):
+        items = [{"text": "Group Chats", "x": 30, "y": 5, "w": 60, "h": 10},
+                 {"text": "Alice Fans", "x": 70, "y": 30, "w": 60, "h": 14},
+                 {"text": "Alice", "x": 70, "y": 60, "w": 40, "h": 14}]
+        self.assertEqual(W.VisionDriver.pick_search_result(items, ["Alice"])["y"], 60)
+        self.assertIsNone(W.VisionDriver.pick_search_result(items, ["Bob"]))
+
+    def test_ocr_matches(self):
+        msg = "[wechat_send test] 4: a longer message 中文，测试！"
+        self.assertTrue(W.ocr_matches(msg.replace(" message", "\nmessage"), msg))
+        self.assertTrue(W.ocr_matches(msg.replace("，", ","), msg))  # NFKC folding
+        self.assertTrue(W.ocr_matches(msg.replace("longer", "1onger"), msg))  # one misread
+        self.assertFalse(W.ocr_matches(msg[:20], msg))  # truncated read-back
+        self.assertFalse(W.ocr_matches("hi", "ho"))  # short texts must be exact
+        self.assertFalse(W.ocr_matches("", msg))
+
+    def test_full_send_flow(self):
+        d, c = self.driver()
+        base = Base("setUp")
+        base.setUp()
+        try:
+            res = base.sender(d).send_text("Alice", "hello there, this is a test")
+        finally:
+            base.tearDown()
+        self.assertEqual(res["status"], "sent")
+        send = [a for op, a in c.calls if op == "v_send"][0]
+        self.assertEqual(send["expected_title"], "Alice")
+        self.assertEqual(send["expected_input"], "hello there, this is a test")
+
+    def test_needs_screen_capture(self):
+        d, c = self.driver()
+        c.screen_capture = False
+        with self.assertRaises(W.AccessibilityDenied):
+            d.prepare()
+
+    def test_make_driver(self):
+        self.assertIsInstance(W.make_driver({}), W.VisionDriver)
+        d = W.make_driver({"send_driver": "helper_ax"})
+        self.assertIs(type(d), W.HelperDriver)
+
+
 if __name__ == "__main__":
     unittest.main()

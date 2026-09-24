@@ -456,6 +456,10 @@ class UIDriver:
     def clear_input(self):
         raise NotImplementedError
 
+    def input_matches(self, current, text):
+        """Does the input box (as read back) hold exactly `text`?"""
+        return normalize_text(current) == normalize_text(text)
+
     def press_send(self, send_key, expected_title, expected_input):
         """Press the send key, but only if the chat title is still exactly
         `expected_title` and the input box still holds exactly
@@ -583,7 +587,7 @@ class Sender:
             if not title_matches(title, names, target["is_group"]):
                 raise UIError("chat title changed before sending; input cleared")
             current = d.input_text()
-            if current is None or normalize_text(current) != normalize_text(text):
+            if current is None or not d.input_matches(current, text):
                 raise UIError("input box does not contain exactly the message; "
                               "input cleared", input_readable=current is not None)
             if dry_run:
@@ -669,6 +673,8 @@ _HELPER_TIMEOUTS = {
     "open_search": 8, "search_results": 8, "click_result": 8, "search_enter": 6,
     "escape": 5, "chat_title": 8, "input_text": 6, "paste_input": 8,
     "clear_input": 6, "send": 8, "probe": 32,
+    "v_ocr": 12, "v_open_search": 8, "v_search_enter": 12, "v_paste": 8, "v_clear": 7,
+    "v_send": 27,
 }
 
 _HELPER_ERRORS = {
@@ -815,15 +821,196 @@ class HelperDriver(UIDriver):
 
     def probe(self, show_text=False):
         try:
-            return self.client.call("probe", show_text=show_text).get("lines") or []
+            res = self.client.call("probe", show_text=show_text)
+            return (res.get("lines") or []) + ["# " + d for d in res.get("diag") or []]
         finally:
             self.client.close()
 
 
+def _squash(text):
+    """Text for OCR comparison: no whitespace, full-width punctuation folded."""
+    import unicodedata
+    return "".join(unicodedata.normalize("NFKC", text or "").split())
+
+
+def ocr_matches(seen, text, min_ratio=0.92):
+    """Loose equality for OCR'd input text: line wrapping and spacing are
+    ignored; a few misread characters are tolerated for longer texts, but the
+    read-back must cover the whole message (lengths within 8%)."""
+    import difflib
+    a, b = _squash(seen), _squash(text)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if len(b) < 12 or abs(len(a) - len(b)) > max(1, len(b) * 0.08):
+        return False
+    return difflib.SequenceMatcher(None, a, b, autojunk=False).ratio() >= min_ratio
+
+
+class VisionDriver(HelperDriver):
+    """Helper driver for WeChat 4.x, whose UI has no accessibility tree.
+
+    The helper screenshots WeChat's window and OCRs regions (Screen Recording
+    permission); this class decides where those regions are. Layout of the
+    main window (window-relative points, top-left origin):
+
+        | sidebar | chat list (search box on top) | chat pane: title on top,  |
+        |         |                               | messages, toolbar, input  |
+
+    The chat pane's left edge is found from the chat list's right-most text;
+    the title is the left-most text in the pane's top band; the input box is
+    the band below the toolbar (INPUT_TOP of the window height and below).
+    """
+
+    TOP_BAND = 60          # title / search box live above this y
+    INPUT_TOP = 0.845      # input box starts at this fraction of the height
+    SETTLE = 0.8
+
+    def __init__(self, client=None, sleep=time.sleep):
+        super().__init__(client)
+        self.sleep = sleep
+        self.size = None
+        self.title_rect = None
+        self.input_rect = None
+        self.input_point = None
+
+    def prepare(self):
+        self.size = self.title_rect = self.input_rect = self.input_point = None
+        token = super().prepare()
+        if not self.client.call("status").get("screen_capture"):
+            raise AccessibilityDenied(
+                "WeChatSendHelper has no Screen Recording permission (it reads WeChat's "
+                "window to check the chat title and message). Open System Settings -> "
+                "Privacy & Security -> Screen & System Audio Recording and turn on "
+                "WeChatSendHelper, then run: launchctl kickstart -k "
+                "gui/$(id -u)/local.wechat-decrypt-export.sendhelper")
+        return token
+
+    def _ocr(self, rect=None):
+        res = self.client.call("v_ocr", **({"rect": [int(v) for v in rect]} if rect else {}))
+        self.size = tuple(res.get("window") or (0, 0))
+        return res
+
+    def _layout(self):
+        """Locate the chat pane, title and input box from one full-window OCR."""
+        res = self._ocr()
+        w, h = self.size
+        items = res.get("items") or []
+        pane_left = self._list_right_edge(items, w) + 6
+        top = sorted((i for i in items if i["y"] < self.TOP_BAND and i["x"] >= pane_left
+                      and i["x"] < w * 0.6), key=lambda i: i["x"])
+        self.title_rect = None
+        if top:
+            t = top[0]
+            right = min(w * 0.6, t["x"] + t["w"] + 160)
+            self.title_rect = [pane_left, max(0, t["y"] - 8), right - pane_left,
+                               min(t["h"] + 16, self.TOP_BAND - max(0, t["y"] - 8))]
+        y0 = h * self.INPUT_TOP
+        self.input_rect = [pane_left + 4, y0, w - pane_left - 12, h - y0 - 6]
+        self.input_point = (pane_left + (w - pane_left) / 2, y0 + (h - y0) / 2)
+
+    def _list_right_edge(self, items, w):
+        """The chat list's timestamps are right-aligned: the most common right
+        edge (3+ items, 3 pt tolerance) in the left part of the window."""
+        edges = sorted(i["x"] + i["w"] for i in items
+                       if i["y"] > self.TOP_BAND and i["x"] + i["w"] < w * 0.45)
+        best, best_n = None, 0
+        for e in edges:
+            n = sum(1 for x in edges if e - 3 <= x <= e)
+            if n > best_n or (n == best_n and best is not None and e > best):
+                best, best_n = e, n
+        return best if best_n >= 3 else w * 0.2
+
+    # Section headings of WeChat's search results popup. Only rows under a
+    # chat section are ever clicked; other sections (chat history, files,
+    # internet search, ...) end the chat sections.
+    CHAT_SECTIONS = {"contacts", "group chats", "联系人", "群聊", "聯絡人", "群組"}
+    OTHER_SECTIONS = {"chat history", "chat files", "internet search results", "search",
+                      "official accounts", "channels", "mini programs", "articles",
+                      "聊天记录", "文件", "搜一搜", "公众号", "视频号", "小程序", "文章",
+                      "网络搜索结果", "聊天記錄"}
+
+    @classmethod
+    def pick_search_result(cls, items, expected_names):
+        """The top-most popup row whose text is exactly one of expected_names,
+        inside a Contacts / Group Chats section. None if there is none."""
+        rows = sorted(items, key=lambda i: (i["y"], i["x"]))
+        names = {n.strip() for n in expected_names if n}
+        section = None
+        for it in rows:
+            t = it["text"].strip()
+            low = t.lower()
+            if low in cls.CHAT_SECTIONS:
+                section = "chat"
+                continue
+            if low in cls.OTHER_SECTIONS or low.startswith(("q ", "search ")):
+                section = "other"
+                continue
+            if section == "chat" and t in names:
+                return it
+        return None
+
+    def open_chat(self, query, expected_names, settle=1.2, sleep=None):
+        sleep = sleep or self.sleep
+        self.client.call("v_open_search", query=query)
+        hit = None
+        for _ in range(4):  # results load asynchronously
+            sleep(self.SETTLE)
+            try:
+                res = self.client.call("v_ocr", popup=True)
+            except UIError:
+                continue
+            hit = self.pick_search_result(res.get("items") or [], expected_names)
+            if hit:
+                break
+        if hit is None:
+            with contextlib.suppress(SendError):
+                self.client.call("escape")
+            raise UIError("WeChat's search shows no contact or group with exactly this name; "
+                          "nothing was sent")
+        self.client.call("v_click_popup", x=int(hit["x"] + hit["w"] / 2),
+                         y=int(hit["y"] + hit["h"] / 2))
+        sleep(settle)
+        self._layout()
+
+    def chat_title(self):
+        if self.title_rect is None:
+            self._layout()
+        if self.title_rect is None:
+            return None
+        return self._ocr(self.title_rect).get("text")
+
+    def input_text(self):
+        if self.input_rect is None:
+            self._layout()
+        return self._ocr(self.input_rect).get("text")
+
+    def input_matches(self, current, text):
+        return ocr_matches(current, text)
+
+    def paste_into_input(self, text):
+        x, y = self.input_point
+        self.client.call("v_paste", text=text, x=int(x), y=int(y))
+
+    def clear_input(self):
+        x, y = self.input_point
+        self.client.call("v_clear", x=int(x), y=int(y))
+
+    def press_send(self, send_key, expected_title, expected_input):
+        return self.client.call("v_send", key=send_key, expected_title=expected_title,
+                                expected_input=expected_input,
+                                title_rect=[int(v) for v in self.title_rect],
+                                input_rect=[int(v) for v in self.input_rect]).get("leftover")
+
+
 def make_driver(cfg):
     kind = (cfg or {}).get("send_driver", "helper")
-    if kind == "helper":
-        return HelperDriver(HelperClient((cfg or {}).get("send_helper_socket") or HELPER_SOCKET))
+    socket_path = (cfg or {}).get("send_helper_socket") or HELPER_SOCKET
+    if kind == "helper":  # WeChat 4.x: screenshots + OCR through the helper
+        return VisionDriver(HelperClient(socket_path))
+    if kind == "helper_ax":  # UIs that expose an accessibility tree
+        return HelperDriver(HelperClient(socket_path))
     if kind == "direct":
         return AXDriver()
     raise SendError(f"unknown send_driver {kind!r} (use 'helper' or 'direct')")
@@ -851,7 +1038,7 @@ def helper_check(client=None, launchctl=None):
         st = client.call("status")
         info["running"] = True
         info.update({k: st.get(k) for k in (
-            "version", "trusted", "screen_locked", "wechat_running",
+            "version", "trusted", "screen_capture", "screen_locked", "wechat_running",
             "wechat_frontmost", "wechat_window", "wechat_minimized")})
         if not st.get("trusted"):
             info["hint"] = HELPER_TRUST_HINT

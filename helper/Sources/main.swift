@@ -21,8 +21,10 @@
 import AppKit
 import ApplicationServices
 import Foundation
+import ScreenCaptureKit
+import Vision
 
-let helperVersion = "1"
+let helperVersion = "5"
 let wechatBundleID = "com.tencent.xinWeChat"
 
 // MARK: - Errors / JSON
@@ -131,13 +133,22 @@ enum Key: CGKeyCode {
     case a = 0, f = 3, v = 9, returnKey = 36, delete = 51, escape = 53
 }
 
-func sleepMs(_ ms: Int) { usleep(useconds_t(ms * 1000)) }
+/// Sleeps; on the main thread it keeps the run loop turning so NSWorkspace
+/// state (frontmostApplication) stays current while an op waits.
+func sleepMs(_ ms: Int) {
+    if Thread.isMainThread {
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: Double(ms) / 1000))
+    } else {
+        usleep(useconds_t(ms * 1000))
+    }
+}
 
 // MARK: - Driver
 
 final class Driver {
     var pid: pid_t = 0
     var app: AXUIElement?
+    var searchArmed = false
     var searchField: AXUIElement?
 
     // --- state ---
@@ -157,7 +168,18 @@ final class Driver {
             .first { !$0.isTerminated }
     }
 
-    func frontmost() -> NSRunningApplication? { return NSWorkspace.shared.frontmostApplication }
+    /// Asks the accessibility server (always current) and falls back to
+    /// NSWorkspace, whose cached value only updates as the run loop turns.
+    func frontmost() -> NSRunningApplication? {
+        if AXIsProcessTrusted(), let f = axAttr(AXUIElementCreateSystemWide(), kAXFocusedApplicationAttribute) {
+            var p: pid_t = 0
+            // swiftlint:disable:next force_cast
+            if AXUIElementGetPid(f as! AXUIElement, &p) == .success, let a = NSRunningApplication(processIdentifier: p) {
+                return a
+            }
+        }
+        return NSWorkspace.shared.frontmostApplication
+    }
 
     func attach() throws -> AXUIElement {
         guard AXIsProcessTrusted() else {
@@ -168,8 +190,13 @@ final class Driver {
             pid = w.processIdentifier
             let a = AXUIElementCreateApplication(pid)
             AXUIElementSetMessagingTimeout(a, 2.0)
+            // Chromium/Qt-style apps build their accessibility tree only
+            // when an assistive client asks for it through one of these.
+            axSet(a, "AXManualAccessibility", kCFBooleanTrue)
+            axSet(a, "AXEnhancedUserInterface", kCFBooleanTrue)
             app = a
             searchField = nil
+            sleepMs(300)
         }
         return app!
     }
@@ -338,6 +365,7 @@ final class Driver {
             "version": helperVersion,
             "helper_pid": Int(getpid()),
             "trusted": AXIsProcessTrusted(),
+            "screen_capture": CGPreflightScreenCaptureAccess(),
             "screen_locked": screenLocked(),
             "on_console": onConsole(),
         ]
@@ -381,6 +409,15 @@ final class Driver {
         axSet(app!, kAXFrontmostAttribute, kCFBooleanTrue)
         w.activate()
         AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+        if frontmost()?.processIdentifier != w.processIdentifier, let url = w.bundleURL {
+            // macOS 14+ ignores activate() from a background agent;
+            // an open request through LaunchServices is still honored.
+            let cfg = NSWorkspace.OpenConfiguration()
+            cfg.activates = true
+            let sem = DispatchSemaphore(value: 0)
+            NSWorkspace.shared.openApplication(at: url, configuration: cfg) { _, _ in sem.signal() }
+            _ = sem.wait(timeout: .now() + 3)
+        }
         for _ in 0..<30 {
             if frontmost()?.processIdentifier == w.processIdentifier { break }
             sleepMs(50)
@@ -566,7 +603,38 @@ final class Driver {
             if axBool(el, kAXFocusedAttribute) == true { line += " [focused]" }
             lines.append(line)
         }
-        return ["lines": lines]
+        var diag: [String] = []
+        let a = try attach()
+        var names: CFArray?
+        if AXUIElementCopyAttributeNames(a, &names) == .success, let n = names as? [String] {
+            diag.append("app attrs: " + n.joined(separator: ","))
+        }
+        for attr in ["AXManualAccessibility", "AXEnhancedUserInterface"] {
+            diag.append("app \(attr)=\(String(describing: axAttr(a, attr)))")
+        }
+        diag.append("app children: \(axChildren(a).count)")
+        if AXUIElementCopyAttributeNames(win, &names) == .success, let n = names as? [String] {
+            diag.append("window attrs: " + n.joined(separator: ","))
+        }
+        if let nav = axAttr(win, "AXChildrenInNavigationOrder") as? [AXUIElement] {
+            diag.append("window nav children: \(nav.count)")
+        }
+        if let f = axElement(a, kAXFocusedUIElementAttribute) {
+            diag.append("focused: \(axRole(f)) \(axFrame(f).map { "\($0)" } ?? "-")")
+        }
+        if let wf = axFrame(win) {
+            // Hit-test a grid: some toolkits answer these even with no children.
+            for (fx, fy) in [(0.15, 0.1), (0.15, 0.5), (0.6, 0.06), (0.6, 0.5), (0.6, 0.9)] {
+                var hit: AXUIElement?
+                let x = Float(wf.minX + wf.width * CGFloat(fx)), y = Float(wf.minY + wf.height * CGFloat(fy))
+                if AXUIElementCopyElementAtPosition(a, x, y, &hit) == .success, let h = hit {
+                    diag.append("hit(\(fx),\(fy)): \(axRole(h)) \(axFrame(h).map { "\($0)" } ?? "-")")
+                } else {
+                    diag.append("hit(\(fx),\(fy)): none")
+                }
+            }
+        }
+        return ["lines": lines, "diag": diag]
     }
 
     func dispatch(_ op: String, _ req: JSON) throws -> JSON {
@@ -589,6 +657,13 @@ final class Driver {
         case "clear_input": return try clearInput()
         case "send": return try send(req)
         case "probe": return try probe(req)
+        case "v_ocr": return try vOCR(req)
+        case "v_open_search": return try vOpenSearch(req)
+        case "v_search_enter": return try vSearchEnter(req)
+        case "v_click_popup": return try vClickPopup(req)
+        case "v_paste": return try vPaste(req)
+        case "v_clear": return try vClear(req)
+        case "v_send": return try vSend(req)
         default: throw OpError("unknown_op", "unknown op")
         }
     }
@@ -599,6 +674,8 @@ let opTimeouts: [String: Double] = [
     "open_search": 6, "search_results": 6, "click_result": 6, "search_enter": 4,
     "escape": 3, "chat_title": 6, "input_text": 4, "paste_input": 6,
     "clear_input": 4, "send": 6, "probe": 30,
+    "v_ocr": 10, "v_open_search": 6, "v_search_enter": 10, "v_paste": 6, "v_clear": 5, "v_click_popup": 8,
+    "v_send": 25,
 ]
 
 // MARK: - Server
@@ -753,6 +830,304 @@ final class Server {
     }
 }
 
+
+// MARK: - Vision mode (WeChat 4 exposes no accessibility tree)
+//
+// WeChat 4.x draws its own UI and publishes only the window buttons to
+// Accessibility, so the chat title and input box can't be read through AX.
+// In vision mode the helper screenshots WeChat's main window (Screen
+// Recording permission) and reads regions with Apple's on-device OCR.
+// Layout decisions (where the title / input are) are made by the caller; the
+// helper enforces coarse bounds so that e.g. a "search" Enter can never be
+// pressed while the chat input is what holds the text:
+//   - v_search_enter only after v_open_search, and only if the query is
+//     visible in a rect in the top 15% of the window (the search box);
+//   - v_paste / v_clear only click in the lower half of the window;
+//   - v_send re-reads the title rect (top 15%) and the input rect (lower
+//     half) and presses the key only if both match the approved strings.
+// Coordinates are window-relative points, origin top-left.
+
+final class Pending<T> {
+    let lock = NSLock()
+    var value: T?
+    var error: Error?
+    var done = false
+    func finish(_ v: T?, _ e: Error?) {
+        lock.lock(); value = v; error = e; done = true; lock.unlock()
+    }
+    func isDone() -> Bool { lock.lock(); defer { lock.unlock() }; return done }
+}
+
+func waitFor<T>(_ p: Pending<T>, seconds: Double) -> Bool {
+    let end = Date(timeIntervalSinceNow: seconds)
+    while !p.isDone() && Date() < end { sleepMs(20) }
+    return p.isDone()
+}
+
+struct OCRItem {
+    let text: String
+    let rect: CGRect   // window-relative points
+    let conf: Float
+}
+
+extension Driver {
+    func screenCaptureAllowed() -> Bool { return CGPreflightScreenCaptureAccess() }
+
+    /// Screenshot of WeChat's largest on-screen normal window, or (popup) of
+    /// its largest floating window, e.g. the search results list.
+    func captureWindow(popup: Bool = false) throws -> (CGImage, CGSize, CGFloat) {
+        let (img, frame, scale) = try captureFrame(popup: popup)
+        return (img, frame.size, scale)
+    }
+
+    func captureFrame(popup: Bool) throws -> (CGImage, CGRect, CGFloat) {
+        guard screenCaptureAllowed() else {
+            throw OpError("no_screen_capture", "WeChatSendHelper has no Screen Recording permission")
+        }
+        let pc = Pending<SCShareableContent>()
+        SCShareableContent.getExcludingDesktopWindows(true, onScreenWindowsOnly: true) { c, e in
+            pc.finish(c, e)
+        }
+        guard waitFor(pc, seconds: 3), let content = pc.value else {
+            throw OpError("capture_failed", "could not list windows: \(pc.error.map { "\($0)" } ?? "timeout")")
+        }
+        let wins = content.windows.filter {
+            $0.owningApplication?.processID == pid && $0.frame.width > 100 && $0.frame.height > 60
+                && (popup ? $0.windowLayer > 0 : ($0.windowLayer == 0 && $0.frame.width > 300))
+        }
+        guard let win = wins.max(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }) else {
+            if popup { throw OpError("no_popup", "WeChat's search results are not showing") }
+            throw OpError("no_window", "WeChat main window is not on screen")
+        }
+        let filter = SCContentFilter(desktopIndependentWindow: win)
+        let scale = CGFloat(filter.pointPixelScale)
+        let cfg = SCStreamConfiguration()
+        cfg.width = Int(win.frame.width * scale)
+        cfg.height = Int(win.frame.height * scale)
+        cfg.showsCursor = false
+        cfg.ignoreShadowsSingleWindow = true
+        let pi = Pending<CGImage>()
+        SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg) { img, e in
+            pi.finish(img, e)
+        }
+        guard waitFor(pi, seconds: 4), let img = pi.value else {
+            throw OpError("capture_failed", "screenshot failed: \(pi.error.map { "\($0)" } ?? "timeout")")
+        }
+        return (img, win.frame, CGFloat(img.width) / win.frame.width)
+    }
+
+    /// OCR of `rect` (window points; nil = whole window).
+    func ocr(_ rect: CGRect?, from shot: (CGImage, CGSize, CGFloat)? = nil,
+             popup: Bool = false) throws -> (items: [OCRItem], size: CGSize) {
+        let (img, size, scale) = try shot ?? captureWindow(popup: popup)
+        var region = CGRect(origin: .zero, size: size)
+        if let r = rect { region = r.intersection(region) }
+        guard region.width >= 4, region.height >= 4 else { return ([], size) }
+        let px = CGRect(x: region.minX * scale, y: region.minY * scale,
+                        width: region.width * scale, height: region.height * scale).integral
+        guard let crop = img.cropping(to: px) else { return ([], size) }
+        let req = VNRecognizeTextRequest()
+        req.recognitionLevel = .accurate
+        req.usesLanguageCorrection = false
+        req.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US"]
+        try VNImageRequestHandler(cgImage: crop, options: [:]).perform([req])
+        var items: [OCRItem] = []
+        for o in req.results ?? [] {
+            guard let c = o.topCandidates(1).first else { continue }
+            let b = o.boundingBox  // normalized, origin bottom-left, relative to crop
+            let r = CGRect(x: region.minX + b.minX * region.width,
+                           y: region.minY + (1 - b.maxY) * region.height,
+                           width: b.width * region.width, height: b.height * region.height)
+            items.append(OCRItem(text: c.string, rect: r, conf: c.confidence))
+        }
+        return (items, size)
+    }
+
+    /// Items joined into lines (top to bottom, left to right). A lone caret
+    /// read as "|" / "I" / "l" at a line end is dropped.
+    func joined(_ items: [OCRItem]) -> String {
+        let sorted = items.sorted { $0.rect.midY < $1.rect.midY }
+        var lines: [[OCRItem]] = []
+        for it in sorted {
+            if let last = lines.last?.first, abs(last.rect.midY - it.rect.midY) < max(last.rect.height, it.rect.height) * 0.5 {
+                lines[lines.count - 1].append(it)
+            } else {
+                lines.append([it])
+            }
+        }
+        let caret = CharacterSet(charactersIn: "|Il丨")
+        return lines.map { line -> String in
+            var t = line.sorted { $0.rect.minX < $1.rect.minX }.map { $0.text }.joined(separator: " ")
+            while let last = t.unicodeScalars.last, caret.contains(last),
+                  t.count > 1 || line.count == 1 && line[0].rect.width < 6 {
+                t = String(t.dropLast()).trimmingCharacters(in: .whitespaces)
+                if t.isEmpty { break }
+            }
+            return t
+        }.filter { !$0.isEmpty }.joined(separator: "\n")
+    }
+
+    func rectArg(_ req: JSON, _ key: String) throws -> CGRect {
+        guard let a = req[key] as? [NSNumber], a.count == 4 else {
+            throw OpError("bad_request", "\(key) must be [x, y, w, h]")
+        }
+        return CGRect(x: a[0].doubleValue, y: a[1].doubleValue, width: a[2].doubleValue, height: a[3].doubleValue)
+    }
+
+    func pointArg(_ req: JSON) throws -> CGPoint {
+        guard let x = (req["x"] as? NSNumber)?.doubleValue, let y = (req["y"] as? NSNumber)?.doubleValue else {
+            throw OpError("bad_request", "x and y required")
+        }
+        return CGPoint(x: x, y: y)
+    }
+
+    func windowOrigin() throws -> CGRect {
+        let win = try requireWindow()
+        guard let f = axFrame(win) else { throw OpError("no_window", "WeChat window has no frame") }
+        return f
+    }
+
+    /// Click a window-relative point that must lie in the lower half.
+    func clickLower(_ p: CGPoint) throws {
+        let wf = try windowOrigin()
+        guard p.x > 0, p.x < wf.width, p.y > wf.height * 0.5, p.y < wf.height else {
+            throw OpError("bad_request", "point must be inside the lower half of the window")
+        }
+        click(CGRect(x: wf.minX + p.x - 1, y: wf.minY + p.y - 1, width: 2, height: 2))
+        sleepMs(150)
+    }
+
+    // --- ops ---
+
+    func vOCR(_ req: JSON) throws -> JSON {
+        try requireReady()
+        let rect = req["rect"] == nil ? nil : try rectArg(req, "rect")
+        let (items, size) = try ocr(rect, popup: (req["popup"] as? Bool) ?? false)
+        let maxItems = min((req["max_items"] as? Int) ?? 200, 1000)
+        return ["window": [Int(size.width), Int(size.height)],
+                "text": joined(items),
+                "items": items.prefix(maxItems).map { i -> JSON in
+                    ["text": i.text, "x": Int(i.rect.minX), "y": Int(i.rect.minY),
+                     "w": Int(i.rect.width.rounded(.up)), "h": Int(i.rect.height.rounded(.up)),
+                     "conf": Double(i.conf)]
+                }]
+    }
+
+    func vOpenSearch(_ req: JSON) throws -> JSON {
+        let query = try str(req, "query")
+        guard !query.isEmpty, query.count <= 200, !query.contains("\n") else {
+            throw OpError("bad_request", "bad query")
+        }
+        try requireFront()
+        searchArmed = false
+        key(.f, cmd: true)
+        sleepMs(350)
+        key(.a, cmd: true)
+        withClipboard(query) {
+            key(.v, cmd: true)
+            sleepMs(300)
+        }
+        searchArmed = true
+        return [:]
+    }
+
+    func vSearchEnter(_ req: JSON) throws -> JSON {
+        let query = try str(req, "query")
+        let rect = try rectArg(req, "rect")
+        guard searchArmed else { throw OpError("no_search", "call v_open_search first") }
+        searchArmed = false
+        try requireFront()
+        let (items, size) = try ocr(rect)
+        guard rect.maxY <= size.height * 0.15 else {
+            throw OpError("bad_request", "search rect must be in the top 15% of the window")
+        }
+        let seen = joined(items).replacingOccurrences(of: " ", with: "")
+        guard seen.contains(query.replacingOccurrences(of: " ", with: "")) else {
+            throw OpError("precondition_failed", "the query is not visible in the search box")
+        }
+        key(.returnKey)
+        sleepMs(500)
+        return [:]
+    }
+
+    /// Click a point (popup-relative) inside WeChat's search results popup;
+    /// only valid right after v_open_search.
+    func vClickPopup(_ req: JSON) throws -> JSON {
+        let p = try pointArg(req)
+        guard searchArmed else { throw OpError("no_search", "call v_open_search first") }
+        searchArmed = false
+        try requireFront()
+        let (_, frame, _) = try captureFrame(popup: true)
+        guard p.x > 0, p.y > 0, p.x < frame.width, p.y < frame.height else {
+            throw OpError("bad_request", "point is outside the search results")
+        }
+        click(CGRect(x: frame.minX + p.x - 1, y: frame.minY + p.y - 1, width: 2, height: 2))
+        sleepMs(500)
+        return [:]
+    }
+
+    func vPaste(_ req: JSON) throws -> JSON {
+        let text = try str(req, "text")
+        guard !text.isEmpty, text.count <= 20000 else { throw OpError("bad_request", "bad text") }
+        try requireFront()
+        searchArmed = false
+        try clickLower(try pointArg(req))
+        withClipboard(text) {
+            key(.v, cmd: true)
+            sleepMs(400)
+        }
+        return [:]
+    }
+
+    func vClear(_ req: JSON) throws -> JSON {
+        try requireFront()
+        searchArmed = false
+        try clickLower(try pointArg(req))
+        key(.a, cmd: true)
+        key(.delete)
+        sleepMs(150)
+        return [:]
+    }
+
+    func vSend(_ req: JSON) throws -> JSON {
+        let expectedTitle = try str(req, "expected_title")
+        let expectedInput = try str(req, "expected_input")
+        let titleRect = try rectArg(req, "title_rect")
+        let inputRect = try rectArg(req, "input_rect")
+        let keyName = (req["key"] as? String) ?? "enter"
+        guard keyName == "enter" || keyName == "cmd_enter" else {
+            throw OpError("bad_request", "key must be enter or cmd_enter")
+        }
+        guard !expectedTitle.isEmpty, !expectedInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw OpError("bad_request", "empty expected_title / expected_input")
+        }
+        searchArmed = false
+        try requireFront()
+        let shot = try captureWindow()  // one frame for both checks
+        let size = shot.1
+        guard titleRect.maxY <= size.height * 0.15, inputRect.minY >= size.height * 0.5 else {
+            throw OpError("bad_request", "title rect must be in the top 15%, input rect in the lower half")
+        }
+        guard joined(try ocr(titleRect, from: shot).items) == expectedTitle else {
+            throw OpError("precondition_failed", "chat title is not the approved one")
+        }
+        guard joined(try ocr(inputRect, from: shot).items) == expectedInput else {
+            throw OpError("precondition_failed", "input box does not hold the approved text")
+        }
+        guard frontmost()?.processIdentifier == pid else {
+            throw OpError("not_frontmost", "WeChat lost focus")
+        }
+        key(.returnKey, cmd: keyName == "cmd_enter")
+        var leftover = expectedInput
+        for _ in 0..<10 {
+            sleepMs(150)
+            leftover = joined(try ocr(inputRect).items)
+            if leftover.isEmpty { break }
+        }
+        return ["pressed": true, "leftover": leftover]
+    }
+}
+
 // MARK: - main
 
 let socketPath = (NSHomeDirectory() as NSString)
@@ -767,6 +1142,11 @@ if !AXIsProcessTrusted() {
     // the system prompt once, so the user only has to flip the switch.
     let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
     _ = AXIsProcessTrustedWithOptions(opts)
+}
+
+if !CGPreflightScreenCaptureAccess() {
+    // Adds the helper to System Settings > Screen Recording (vision mode).
+    _ = CGRequestScreenCaptureAccess()
 }
 
 let server = Server(path: socketPath)
