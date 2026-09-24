@@ -120,6 +120,10 @@ class HelperUnavailable(SendError):
     code = "helper_unavailable"
 
 
+class InvalidQuote(SendError):
+    code = "invalid_quote"
+
+
 class UserBusy(SendError):
     """The user kept using the keyboard / mouse; the send never started."""
     code = "user_busy"
@@ -354,7 +358,33 @@ def find_chat_tables(username, decrypted_dir):
     return out
 
 
-def find_sent_message(chat, text, since_ts, cfg, contacts):
+def load_quote_target(chat, message_id, cfg, contacts):
+    """The message to quote: message_id is "N:local_id" (message_N.db) as
+    returned by the MCP tools. Only text messages can be quoted."""
+    m = re.fullmatch(r"\s*(\d+):(\d+)\s*", str(message_id or ""))
+    if not m:
+        raise InvalidQuote(f"bad message id {message_id!r}; expected 'N:local_id'")
+    n, lid = int(m.group(1)), int(m.group(2))
+    tables = [(p, t) for p, t in find_chat_tables(chat["username"], cfg["decrypted_dir"])
+              if C.db_number(p) == n]
+    one = {"username": chat["username"], "name": chat["name"],
+           "is_group": chat["is_group"], "tables": tables}
+    for rec in C.iter_messages(one, cfg["decrypted_dir"], cfg.get("self_wxid"), contacts,
+                               group_nicknames=C.load_group_nicknames(cfg["decrypted_dir"])
+                               if chat["is_group"] else {}):
+        if rec["local_id"] == lid:
+            if rec["kind"] not in ("text", "quote"):
+                raise InvalidQuote(f"only text messages can be quoted (this one is "
+                                   f"{rec['kind']})")
+            text = (rec.get("extra") or {}).get("reply") if rec["kind"] == "quote" else rec["text"]
+            if not (text or "").strip():
+                raise InvalidQuote("the message to quote has no text")
+            return {"id": f"{n}:{lid}", "text": text, "sender": rec["sender"],
+                    "is_self": bool(rec["is_self"]), "ts": rec["ts"]}
+    raise InvalidQuote(f"message {message_id} not found in this chat")
+
+
+def find_sent_message(chat, text, since_ts, cfg, contacts, quote=None):
     """Return the matching self-sent record, or None."""
     decrypted_dir = cfg["decrypted_dir"]
     tables = find_chat_tables(chat["username"], decrypted_dir)
@@ -366,15 +396,23 @@ def find_sent_message(chat, text, since_ts, cfg, contacts):
     found = None
     for rec in C.iter_messages(one, decrypted_dir, cfg.get("self_wxid"), contacts,
                                group_nicknames={}):
-        if (rec["is_self"] and rec["kind"] == "text" and rec["ts"] >= since_ts
-                and normalize_text(rec["text"] or "") == target):
-            found = rec
+        if not rec["is_self"] or rec["ts"] < since_ts:
+            continue
+        if quote is None:
+            if rec["kind"] == "text" and normalize_text(rec["text"] or "") == target:
+                found = rec
+        elif rec["kind"] == "quote":
+            extra = rec.get("extra") or {}
+            qtext = (extra.get("quote") or {}).get("text") or ""
+            if normalize_text(extra.get("reply") or "") == target and \
+                    _squash(quote["text"]).startswith(_squash(qtext)[:20]):
+                found = rec
     return found
 
 
 def verify_sent(chat, text, since_ts, cfg, contacts, timeout=VERIFY_TIMEOUT_S,
                 refresh=refresh_message_dbs, finder=find_sent_message,
-                sleep=time.sleep, clock=time.time):
+                sleep=time.sleep, clock=time.time, quote=None):
     """Poll the decrypted DB until the message shows up. Returns (status, note)."""
     deadline = clock() + timeout
     while True:
@@ -385,7 +423,9 @@ def verify_sent(chat, text, since_ts, cfg, contacts, timeout=VERIFY_TIMEOUT_S,
         if not ok:
             return "unverified", note
         try:
-            if finder(chat, text, since_ts, cfg, contacts):
+            found = finder(chat, text, since_ts, cfg, contacts, quote=quote) if quote \
+                else finder(chat, text, since_ts, cfg, contacts)
+            if found:
                 return "sent", None
         except sqlite3.DatabaseError as e:
             note = f"db read failed: {type(e).__name__}"
@@ -485,6 +525,14 @@ class UIDriver:
         holds exactly it. Returns True if cleared."""
         return False
 
+    def attach_quote(self, quote):
+        """Right-click the quoted message on screen, choose Quote and check the
+        quote preview attached to the input box."""
+        raise UIError("this driver can't quote messages")
+
+    def remove_quote(self):
+        """Remove a quote attached to the input box (no-op if none)."""
+
     def input_matches(self, current, text):
         """Does the input box (as read back) hold exactly `text`?"""
         return normalize_text(current) == normalize_text(text)
@@ -539,10 +587,11 @@ class Sender:
         contacts, chat_list = self.data_loader(self.cfg)
         return resolve_chat(chat, contacts, chat_list), contacts
 
-    def send_text(self, chat, text, *, verify=True, dry_run=False):
+    def send_text(self, chat, text, *, verify=True, dry_run=False, quote=None):
         max_chars = int(self.cfg.get("send_max_chars", DEFAULT_MAX_CHARS))
         validate_text(text, max_chars)
         target, contacts = self.resolve(chat)
+        qinfo = load_quote_target(target, quote, self.cfg, contacts) if quote else None
         if target["is_group"] and target["name"] == target["username"]:
             raise UnsupportedChat("group has no name; WeChat search can't find it reliably",
                                   chat=target)
@@ -556,7 +605,7 @@ class Sender:
             entry = {"chat": target["username"], "len": len(text),
                      "sha256_16": text_hash(text), "dry_run": dry_run}
             try:
-                sent_at = self._drive(target, names, text, send_key, dry_run)
+                sent_at = self._drive(target, names, text, send_key, dry_run, qinfo)
             except SendError as e:
                 ts = self.clock()
                 self.log.append({"ts": ts, "time": _now_iso(ts), **entry,
@@ -578,17 +627,21 @@ class Sender:
             status, note = "unverified", "verification disabled"
         else:
             # Allow for clock skew / second-granularity create_time.
-            status, note = self.verifier(target, text, sent_at - 5, self.cfg, contacts)
+            status, note = (self.verifier(target, text, sent_at - 5, self.cfg, contacts,
+                                          quote=qinfo) if qinfo else
+                            self.verifier(target, text, sent_at - 5, self.cfg, contacts))
             ts = self.clock()
             self.log.append({"ts": ts, "time": _now_iso(ts), "chat": target["username"],
                              "sha256_16": entry["sha256_16"], "event": "verify",
                              "verify_status": status})
         result = {"status": status, "chat": target, "time": _now_iso(sent_at)}
+        if qinfo:
+            result["quoted"] = qinfo["id"]
         if note:
             result["note"] = note
         return result
 
-    def _drive(self, target, names, text, send_key, dry_run):
+    def _drive(self, target, names, text, send_key, dry_run, quote=None):
         d = self.driver
         who = target["name"]
         d.wait_idle(float(self.cfg.get("send_idle_s", DEFAULT_IDLE_S)),
@@ -597,7 +650,7 @@ class Sender:
                         "— please don't use the keyboard or mouse (~10 s)")
         outcome = (False, "Stopped — nothing was sent")
         try:
-            sent_at = self._drive_ui(target, names, text, send_key, dry_run)
+            sent_at = self._drive_ui(target, names, text, send_key, dry_run, quote)
             outcome = (True, "Dry run done — nothing was sent" if dry_run
                        else f"Sent to {who}")
             return sent_at
@@ -608,10 +661,10 @@ class Sender:
             with contextlib.suppress(Exception):
                 d.session_end(*outcome)
 
-    def _drive_ui(self, target, names, text, send_key, dry_run):
+    def _drive_ui(self, target, names, text, send_key, dry_run, quote=None):
         d = self.driver
         token = d.prepare()
-        pasted = False
+        pasted = quoted = False
         try:
             d.open_chat(names[0], names)
             title = None
@@ -628,6 +681,9 @@ class Sender:
                 raise UIError("can't read the chat input box; nothing was typed")
             if existing.strip():
                 raise UIError("the chat has an unsent draft; not touching it")
+            if quote:
+                quoted = True
+                d.attach_quote(quote)
             pasted = True
             d.paste_into_input(text)
             self.sleep(0.2)
@@ -642,10 +698,13 @@ class Sender:
             if dry_run:
                 d.clear_input()
                 pasted = False
+                if quoted:
+                    d.remove_quote()
+                    quoted = False
                 return self.clock()
             sent_at = self.clock()
             leftover = d.press_send(send_key, title, current)
-            pasted = False
+            pasted = quoted = False
             if leftover and leftover.strip():
                 # Enter inserted a newline instead of sending (Cmd+Enter mode?)
                 d.clear_input()
@@ -666,13 +725,16 @@ class Sender:
                         e.extra["draft_left"] = True
                         e.extra["note"] = (f"the message is still typed (unsent) in the "
                                            f"input box of {target['name']}; delete it there")
+            if quoted:
+                with contextlib.suppress(Exception):
+                    d.remove_quote()
             raise
         finally:
             with contextlib.suppress(Exception):
                 d.restore(token)
 
 
-def send_text(chat, text, *, verify=True, dry_run=False, cfg=None, driver=None):
+def send_text(chat, text, *, verify=True, dry_run=False, cfg=None, driver=None, quote=None):
     """Send `text` to `chat` (exact username or exact display name).
 
     Returns {"status": "sent"|"unverified"|"dry_run", "chat": {...}, "time": iso,
@@ -683,17 +745,18 @@ def send_text(chat, text, *, verify=True, dry_run=False, cfg=None, driver=None):
         with contextlib.redirect_stdout(sys.stderr):
             from config import load_config
             cfg = load_config()
-    return Sender(cfg, driver=driver).send_text(chat, text, verify=verify, dry_run=dry_run)
+    return Sender(cfg, driver=driver).send_text(chat, text, verify=verify, dry_run=dry_run,
+                                                quote=quote)
 
 
-def send_message_tool(chat, text, dry_run=False, cfg=None, driver=None):
+def send_message_tool(chat, text, dry_run=False, cfg=None, driver=None, quote=None):
     """MCP-friendly wrapper: never raises, always returns a JSON-able dict.
 
     Success: {"status": "sent"|"unverified"|"dry_run", "chat": {"username",
     "name", "is_group"}, "time": iso8601, ["note"]}
     Failure: {"status": "failed", "error": code, "message": str, [...extra]}
     where code is one of chat_not_found, ambiguous_chat (both carry
-    "candidates"), unsupported_chat, invalid_text, rate_limited ("retry_after"),
+    "candidates"), unsupported_chat, invalid_text, invalid_quote, rate_limited ("retry_after"),
     accessibility_denied, wechat_not_running, screen_locked, user_busy (the user
     kept using the Mac; never started), user_activity (the user used the Mac
     mid-send; stopped before Enter, "draft_left" if the text stayed typed),
@@ -701,7 +764,7 @@ def send_message_tool(chat, text, dry_run=False, cfg=None, driver=None):
     internal_error.
     """
     try:
-        return send_text(chat, text, dry_run=dry_run, cfg=cfg, driver=driver)
+        return send_text(chat, text, dry_run=dry_run, cfg=cfg, driver=driver, quote=quote)
     except SendError as e:
         return e.to_dict()
     except Exception as e:
@@ -962,9 +1025,11 @@ class VisionDriver(HelperDriver):
         self.title_rect = None
         self.input_rect = None
         self.input_point = None
+        self.quote_chip = None
 
     def prepare(self):
         self.size = self.title_rect = self.input_rect = self.input_point = None
+        self.quote_chip = None
         token = super().prepare()
         if not self.client.call("status").get("screen_capture"):
             raise AccessibilityDenied(
@@ -1042,21 +1107,31 @@ class VisionDriver(HelperDriver):
     def open_chat(self, query, expected_names, settle=1.2, sleep=None):
         sleep = sleep or self.sleep
         self.client.call("v_open_search", query=query)
-        hit = None
-        for _ in range(4):  # results load asynchronously
+        hit, prev, seen = None, None, None
+        for _ in range(6):  # results load (and the popup resizes) asynchronously
             sleep(self.SETTLE)
             try:
                 res = self.client.call("v_ocr", popup=True)
-            except UIError:
+            except UIError as e:
+                seen = {"popup": e.extra.get("helper_error", "error")}
                 continue
-            hit = self.pick_search_result(res.get("items") or [], expected_names)
-            if hit:
+            items = res.get("items") or []
+            cur = self.pick_search_result(items, expected_names)
+            cur = dict(cur, popup=tuple(res.get("window") or ())) if cur else None
+            # Click only once the row is at the same place in two readings.
+            if cur and prev and cur["popup"] == prev["popup"] \
+                    and abs(cur["x"] - prev["x"]) <= 3 and abs(cur["y"] - prev["y"]) <= 3:
+                hit = cur
                 break
+            prev = cur
+            known = self.CHAT_SECTIONS | self.OTHER_SECTIONS
+            seen = {"popup_items": len(items),
+                    "sections": [i["text"] for i in items if i["text"].strip().lower() in known]}
         if hit is None:
             with contextlib.suppress(SendError):
                 self.client.call("escape")
             raise UIError("WeChat's search shows no contact or group with exactly this name; "
-                          "nothing was sent")
+                          "nothing was sent", search_seen=seen)
         self.client.call("v_click_popup", x=int(hit["x"] + hit["w"] / 2),
                          y=int(hit["y"] + hit["h"] / 2))
         sleep(settle)
@@ -1075,7 +1150,84 @@ class VisionDriver(HelperDriver):
         return self._ocr(self.input_rect).get("text")
 
     def input_matches(self, current, text):
+        if self.quote_chip:
+            # The quote preview sits under the typed text in the input box.
+            lines = (current or "").split("\n")
+            if not lines or lines[-1] != self.quote_chip:
+                return False
+            current = "\n".join(lines[:-1])
         return ocr_matches(current, text)
+
+    QUOTE_MENU = ("Quote", "引用")
+
+    @staticmethod
+    def _bubble_match(item_text, target):
+        """Is this OCR line the start of `target` (a bubble's first line)?"""
+        a, b = _squash(item_text), _squash(target)
+        if not a or not b:
+            return False
+        if a == b:
+            return True
+        return len(a) >= min(len(b), 4) and b.startswith(a)
+
+    @staticmethod
+    def _chip_matches(chip, quote):
+        """Quote preview "Sender: text…" -> does it show `quote`?"""
+        name, sep, qtext = _squash(chip).partition(":")
+        if not sep:
+            return False
+        qtext = qtext.rstrip("…").rstrip(".")
+        target = _squash(quote["text"])
+        if not qtext or not target.startswith(qtext) or len(qtext) < min(len(target), 4):
+            return False
+        return quote["is_self"] or name == _squash(quote["sender"])
+
+    def attach_quote(self, quote):
+        self.quote_chip = None
+        w, h = self.size
+        left = self.title_rect[0] if self.title_rect else w * 0.2
+        top, bottom = self.TOP_BAND + 10, h * self.INPUT_TOP - 40
+        res = self._ocr([left, top, w - left, bottom - top])
+        mid = left + (w - left) / 2
+        first = quote["text"].split("\n")[0]
+        hits = [i for i in res.get("items") or []
+                if self._bubble_match(i["text"], first)
+                and ((i["x"] + i["w"] / 2 > mid) == quote["is_self"])]
+        if not hits:
+            raise UIError("the message to quote isn't visible in the chat window (only "
+                          "recent messages can be quoted); nothing was typed")
+        if len(hits) > 1:
+            raise UIError("the message to quote appears more than once on screen; "
+                          "nothing was typed")
+        b = hits[0]
+        self.client.call("v_right_click", x=int(b["x"] + b["w"] / 2), y=int(b["y"] + b["h"] / 2))
+        self.sleep(0.5)
+        menu = self.client.call("v_ocr", popup=True).get("items") or []
+        item = next((i for i in menu if i["text"].strip() in self.QUOTE_MENU), None)
+        if item is None:
+            with contextlib.suppress(SendError):
+                self.client.call("escape")
+            raise UIError("WeChat's message menu has no Quote item; nothing was typed")
+        self.client.call("v_click_popup", x=int(item["x"] + item["w"] / 2),
+                         y=int(item["y"] + item["h"] / 2), expect=item["text"].strip())
+        self.sleep(0.6)
+        chip = self.input_text() or ""
+        self.quote_chip = chip or None
+        if "\n" in chip or not self._chip_matches(chip, quote):
+            raise UIError("the quote attached to the input box doesn't show the chosen "
+                          "message; nothing was typed")
+
+    def remove_quote(self):
+        """Click the close button just right of the quote preview."""
+        chip, self.quote_chip = self.quote_chip, None
+        if not chip:
+            return
+        items = sorted(self._ocr(self.input_rect).get("items") or [], key=lambda i: i["y"])
+        box = next((i for i in reversed(items) if _squash(i["text"]) == _squash(chip)), None)
+        if box is not None:
+            self.client.call("v_click", x=int(box["x"] + box["w"] + 25),
+                             y=int(box["y"] + box["h"] / 2))
+            self.sleep(0.3)
 
     def paste_into_input(self, text):
         x, y = self.input_point
@@ -1541,6 +1693,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Send a WeChat text message via UI automation")
     ap.add_argument("--to", help="exact chat username or display name")
     ap.add_argument("--text", help="message text (use '-' to read stdin)")
+    ap.add_argument("--quote", metavar="ID",
+                    help="reply quoting this message (id 'N:local_id' from the MCP tools); "
+                         "it must be visible in the chat window")
     ap.add_argument("--dry-run", action="store_true",
                     help="open the chat and paste, then clear instead of sending")
     ap.add_argument("--no-verify", action="store_true")
@@ -1591,7 +1746,7 @@ def main(argv=None):
             return 1
     try:
         res = sender.send_text(args.to, text, verify=not args.no_verify,
-                               dry_run=args.dry_run)
+                               dry_run=args.dry_run, quote=args.quote)
     except SendError as e:
         print(json.dumps(e.to_dict(), ensure_ascii=False, indent=2))
         return 2
