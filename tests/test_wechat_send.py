@@ -496,6 +496,13 @@ class RefreshTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("decrypt failed", note)
 
+SESSION_DEFAULTS = {
+    "idle": lambda req: {"any_idle_s": 100.0, "input_idle_s": 100.0},
+    "session_begin": lambda req: {},
+    "session_end": lambda req: {},
+}
+
+
 class FakeHelperServer:
     """Unix-socket server speaking the helper protocol from a handler table."""
 
@@ -524,7 +531,7 @@ class FakeHelperServer:
             for line in f:
                 req = json.loads(line)
                 self.requests.append(req)
-                h = self.handlers.get(req["op"])
+                h = self.handlers.get(req["op"], SESSION_DEFAULTS.get(req["op"]))
                 if h is None:
                     resp = {"ok": False, "error": {"code": "unknown_op", "message": "x"}}
                 elif h == "hang":
@@ -647,9 +654,10 @@ class HelperDriverTests(unittest.TestCase):
         res = sender.send_text("Alice", "hello")
         self.assertEqual(res["status"], "sent")
         self.assertEqual(self.server.ops(), [
+            "idle", "session_begin",
             "status", "activate", "open_search", "search_results", "click_result",
             "chat_title", "input_text", "paste_input", "chat_title", "input_text",
-            "send", "restore"])
+            "send", "restore", "session_end"])
         reqs = {r["op"]: r for r in self.server.requests}
         self.assertEqual(reqs["click_result"]["text"], "Alice")
         self.assertEqual(reqs["open_search"]["query"], "Alice")
@@ -738,6 +746,8 @@ class FakeVisionClient:
         ]
         self.calls = []
         self.screen_capture = True
+        self.idle = []   # scripted any_idle_s answers, then 100
+        self.fail = {}   # op -> exception to raise
 
     def _window_items(self):
         items = [{"text": self.title, "x": 315, "y": 22, "w": 40, "h": 18},
@@ -764,6 +774,10 @@ class FakeVisionClient:
                 items = [i for i in items if x <= i["x"] < x + w and y <= i["y"] < y + h]
             return {"window": [self.W, self.H], "items": items,
                     "text": "\n".join(i["text"] for i in items)}
+        if op in self.fail:
+            raise self.fail[op]
+        if op == "idle":
+            return {"any_idle_s": self.idle.pop(0) if self.idle else 100.0}
         if op == "status":
             return {"trusted": True, "screen_capture": self.screen_capture,
                     "screen_locked": False, "wechat_running": True}
@@ -840,6 +854,61 @@ class VisionDriverTests(unittest.TestCase):
         send = [a for op, a in c.calls if op == "v_send"][0]
         self.assertEqual(send["expected_title"], "Alice")
         self.assertEqual(send["expected_input"], "hello there, this is a test")
+
+    def sender_for(self, d):
+        base = Base("setUp")
+        base.setUp()
+        self.addCleanup(base.tearDown)
+        return base.sender(d)
+
+    def test_waits_until_user_is_idle(self):
+        d, c = self.driver()
+        c.idle = [0.1, 0.5, 3.0]
+        naps = []
+        d.wait_idle(2.0, 30, sleep=naps.append, clock=lambda: 0)
+        self.assertEqual(len(naps), 2)
+        self.assertEqual([op for op, _ in c.calls].count("idle"), 3)
+
+    def test_user_busy_never_touches_wechat(self):
+        d, c = self.driver()
+        c.idle = [0.0] * 1000
+        t = [0.0]
+
+        def nap(s):
+            t[0] += s
+        orig = W.VisionDriver.wait_idle
+        d.wait_idle = lambda m, to: orig(d, m, to, sleep=nap, clock=lambda: t[0])
+        with self.assertRaises(W.UserBusy) as cm:
+            self.sender_for(d).send_text("Alice", "hello there, this is a test")
+        self.assertEqual(cm.exception.code, "user_busy")
+        ops = [op for op, _ in c.calls]
+        self.assertNotIn("activate", ops)
+        self.assertNotIn("session_begin", ops)
+
+    def test_session_banner_wraps_send(self):
+        d, c = self.driver()
+        self.sender_for(d).send_text("Alice", "hello there, this is a test")
+        ops = [op for op, _ in c.calls]
+        self.assertLess(ops.index("session_begin"), ops.index("activate"))
+        self.assertEqual(ops[-1], "session_end")
+        end = c.calls[-1][1]
+        self.assertTrue(end["ok"])
+        self.assertIn("Alice", end["banner"])
+
+    def test_user_activity_mid_send_leaves_draft_note(self):
+        d, c = self.driver()
+        c.fail["v_send"] = W.UserActivity("you used the Mac")
+        c.fail["v_clear"] = W.UserActivity("you used the Mac")
+        with self.assertRaises(W.UserActivity) as cm:
+            self.sender_for(d).send_text("Alice", "hello there, this is a test")
+        self.assertTrue(cm.exception.extra.get("draft_left"))
+        end = [a for op, a in c.calls if op == "session_end"][-1]
+        self.assertFalse(end["ok"])
+        self.assertIn("you used the Mac", end["banner"])
+
+    def test_helper_activity_codes_map_to_user_activity(self):
+        for code in ("user_activity", "not_frontmost"):
+            self.assertIsInstance(W._HELPER_ERRORS[code]("x"), W.UserActivity)
 
     def test_needs_screen_capture(self):
         d, c = self.driver()

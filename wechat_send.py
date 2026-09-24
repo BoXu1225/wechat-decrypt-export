@@ -56,6 +56,8 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 WECHAT_BUNDLE_ID = "com.tencent.xinWeChat"
 
 DEFAULT_RATE_LIMIT = {"min_interval_s": 3.0, "max_per_minute": 6}
+DEFAULT_IDLE_S = 2.0           # user idle this long before a send starts
+DEFAULT_IDLE_TIMEOUT_S = 30.0  # ... waiting at most this long (then user_busy)
 DEFAULT_MAX_CHARS = 2000
 DEFAULT_LOG = os.path.join("logs", "send_log.jsonl")
 VERIFY_TIMEOUT_S = 10.0
@@ -116,6 +118,17 @@ class ScreenLocked(SendError):
 
 class HelperUnavailable(SendError):
     code = "helper_unavailable"
+
+
+class UserBusy(SendError):
+    """The user kept using the keyboard / mouse; the send never started."""
+    code = "user_busy"
+
+
+class UserActivity(SendError):
+    """The user used the keyboard / mouse (or switched apps) mid-send; stopped
+    before pressing Enter."""
+    code = "user_activity"
 
 
 class UIError(SendError):
@@ -428,6 +441,17 @@ class UIDriver:
         """Press Enter in the search box (opens WeChat's top hit)."""
         raise NotImplementedError
 
+    # Send session (optional): wait until the user is idle, show / hide an
+    # on-screen notice. The default driver does nothing.
+    def wait_idle(self, min_idle, timeout):
+        pass
+
+    def session_begin(self, banner):
+        pass
+
+    def session_end(self, ok, banner):
+        pass
+
     def open_chat(self, query, expected_names, settle=1.2, sleep=time.sleep):
         """Search for `query` and open the matching chat.
 
@@ -561,6 +585,26 @@ class Sender:
 
     def _drive(self, target, names, text, send_key, dry_run):
         d = self.driver
+        who = target["name"]
+        d.wait_idle(float(self.cfg.get("send_idle_s", DEFAULT_IDLE_S)),
+                    float(self.cfg.get("send_idle_timeout_s", DEFAULT_IDLE_TIMEOUT_S)))
+        d.session_begin(f"{'Test-typing' if dry_run else 'Sending'} to {who} "
+                        "— please don't use the keyboard or mouse (~10 s)")
+        outcome = (False, "Stopped — nothing was sent")
+        try:
+            sent_at = self._drive_ui(target, names, text, send_key, dry_run)
+            outcome = (True, "Dry run done — nothing was sent" if dry_run
+                       else f"Sent to {who}")
+            return sent_at
+        except UserActivity:
+            outcome = (False, "Stopped: you used the Mac — nothing was sent")
+            raise
+        finally:
+            with contextlib.suppress(Exception):
+                d.session_end(*outcome)
+
+    def _drive_ui(self, target, names, text, send_key, dry_run):
+        d = self.driver
         token = d.prepare()
         pasted = False
         try:
@@ -603,10 +647,17 @@ class Sender:
                 raise UIError("message was not sent (input still has text; is WeChat "
                               "set to send with Cmd+Enter? set config send_key)")
             return sent_at
-        except BaseException:
+        except BaseException as e:
             if pasted:
-                with contextlib.suppress(Exception):
+                try:
                     d.clear_input()
+                except Exception:
+                    # Don't fight the user for the keyboard: the text stays as
+                    # an unsent draft in that chat.
+                    if isinstance(e, SendError):
+                        e.extra["draft_left"] = True
+                        e.extra["note"] = (f"the message is still typed (unsent) in the "
+                                           f"input box of {target['name']}; delete it there")
             raise
         finally:
             with contextlib.suppress(Exception):
@@ -635,7 +686,10 @@ def send_message_tool(chat, text, dry_run=False, cfg=None, driver=None):
     Failure: {"status": "failed", "error": code, "message": str, [...extra]}
     where code is one of chat_not_found, ambiguous_chat (both carry
     "candidates"), unsupported_chat, invalid_text, rate_limited ("retry_after"),
-    accessibility_denied, wechat_not_running, screen_locked, ui_error,
+    accessibility_denied, wechat_not_running, screen_locked, user_busy (the user
+    kept using the Mac; never started), user_activity (the user used the Mac
+    mid-send; stopped before Enter, "draft_left" if the text stayed typed),
+    ui_error,
     internal_error.
     """
     try:
@@ -674,13 +728,18 @@ _HELPER_TIMEOUTS = {
     "escape": 5, "chat_title": 8, "input_text": 6, "paste_input": 8,
     "clear_input": 6, "send": 8, "probe": 32,
     "v_ocr": 12, "v_open_search": 8, "v_search_enter": 12, "v_paste": 8, "v_clear": 7,
-    "v_send": 27, "v_click_popup": 10,
+    "v_send": 27, "v_click_popup": 10, "idle": 4, "session_begin": 5, "session_end": 5,
 }
 
 _HELPER_ERRORS = {
     "not_trusted": lambda m: AccessibilityDenied(HELPER_TRUST_HINT),
     "screen_locked": lambda m: ScreenLocked("the screen is locked; unlock the Mac to send"),
     "wechat_not_running": lambda m: WeChatNotRunning("WeChat is not running; start it and log in"),
+    "user_activity": lambda m: UserActivity(
+        "you used the keyboard or mouse during the send; stopped before sending"),
+    "not_frontmost": lambda m: UserActivity(
+        "WeChat lost focus during the send (another app came to the front); "
+        "stopped before sending"),
 }
 
 
@@ -774,7 +833,6 @@ class HelperDriver(UIDriver):
             self.client.close()
 
     def prepare(self):
-        self.client.close()
         st = self.client.call("status")
         if not st.get("trusted"):
             raise AccessibilityDenied(HELPER_TRUST_HINT)
@@ -783,6 +841,29 @@ class HelperDriver(UIDriver):
         if not st.get("wechat_running"):
             raise WeChatNotRunning("WeChat is not running; start it and log in")
         return self.client.call("activate").get("previous_pid")
+
+    def wait_idle(self, min_idle, timeout, sleep=time.sleep, clock=time.monotonic):
+        """Wait until there has been no keyboard / mouse input for min_idle s.
+        Starts the send's single helper connection (closed by session_end)."""
+        self.client.close()
+        end = clock() + timeout
+        while True:
+            idle = self.client.call("idle").get("any_idle_s", 0)
+            if idle >= min_idle:
+                return
+            if clock() >= end:
+                raise UserBusy(f"you kept using the Mac for {int(timeout)} s; the send "
+                               "didn't start (nothing was sent) -- try again when idle")
+            sleep(max(0.2, min(1.0, min_idle - idle)))
+
+    def session_begin(self, banner):
+        self.client.call("session_begin", banner=banner)
+
+    def session_end(self, ok, banner):
+        try:
+            self.client.call("session_end", ok=ok, banner=banner)
+        finally:
+            self.client.close()
 
     def open_search(self, query):
         self.client.call("open_search", query=query)
@@ -813,11 +894,8 @@ class HelperDriver(UIDriver):
                                 expected_input=expected_input).get("leftover")
 
     def restore(self, token):
-        try:
-            if token:
-                self.client.call("restore", pid=token)
-        finally:
-            self.client.close()
+        if token:
+            self.client.call("restore", pid=token)
 
     def probe(self, show_text=False):
         try:

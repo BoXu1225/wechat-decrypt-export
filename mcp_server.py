@@ -1368,8 +1368,13 @@ def register_send_tool(srv, data, log):
         refused with candidates. text: plain text (newlines ok, no files/images).
         dry_run=True opens the chat, types and clears the text without sending.
         Drives the WeChat app on this Mac (it must be running and unlocked; takes
-        ~10 s) and verifies the message landed in the chat. Returns status
-        "sent" | "unverified" | "dry_run", or "failed" with error and message."""
+        ~10 s) and verifies the message landed in the chat. It first waits (up to
+        30 s) until the user stops using the keyboard/mouse, and shows an on-screen
+        "hands off" banner while it works. Returns status "sent" | "unverified" |
+        "dry_run", or "failed" with error and message. error "user_busy" (never
+        started) or "user_activity" (the user used the Mac mid-send; nothing was
+        sent): tell the user and offer to retry when they are away from the
+        keyboard; if "draft_left" is set, the text is still typed in that chat."""
         import hashlib
         a = dict(chat=chat, text_sha256_16=hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
                  text_len=len(text), dry_run=dry_run)  # the log never holds the text
