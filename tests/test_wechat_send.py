@@ -777,7 +777,7 @@ class FakeVisionClient:
         if op in self.fail:
             raise self.fail[op]
         if op == "idle":
-            return {"any_idle_s": self.idle.pop(0) if self.idle else 100.0}
+            return {"input_idle_s": self.idle.pop(0) if self.idle else 100.0, "any_idle_s": 0.0}
         if op == "status":
             return {"trusted": True, "screen_capture": self.screen_capture,
                     "screen_locked": False, "wechat_running": True}
@@ -905,6 +905,24 @@ class VisionDriverTests(unittest.TestCase):
         end = [a for op, a in c.calls if op == "session_end"][-1]
         self.assertFalse(end["ok"])
         self.assertIn("you used the Mac", end["banner"])
+
+    def test_user_activity_mid_send_removes_own_text(self):
+        d, c = self.driver()
+        c.fail["v_send"] = W.UserActivity("you used the Mac")
+        real_call = c.call
+
+        def call(op, **a):
+            if op == "v_clear" and "expected_input" not in a:
+                c.calls.append((op, a))
+                raise W.UserActivity("you used the Mac")
+            return real_call(op, **a)
+        c.call = call
+        with self.assertRaises(W.UserActivity) as cm:
+            self.sender_for(d).send_text("Alice", "hello there, this is a test")
+        self.assertNotIn("draft_left", cm.exception.extra)
+        forced = [a for op, a in c.calls if op == "v_clear" and "expected_input" in a]
+        self.assertEqual(forced[0]["expected_input"], "hello there, this is a test")
+        self.assertEqual(c.input, "")
 
     def test_helper_activity_codes_map_to_user_activity(self):
         for code in ("user_activity", "not_frontmost"):

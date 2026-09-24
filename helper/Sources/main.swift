@@ -24,7 +24,7 @@ import Foundation
 import ScreenCaptureKit
 import Vision
 
-let helperVersion = "6"
+let helperVersion = "8"
 let wechatBundleID = "com.tencent.xinWeChat"
 
 // MARK: - Errors / JSON
@@ -1131,6 +1131,7 @@ extension Driver {
 
     func vOCR(_ req: JSON) throws -> JSON {
         try requireReady()
+        try checkUserActivity()  // e.g. Esc closed the search results mid-send
         let rect = req["rect"] == nil ? nil : try rectArg(req, "rect")
         let (items, size) = try ocr(rect, popup: (req["popup"] as? Bool) ?? false)
         let maxItems = min((req["max_items"] as? Int) ?? 200, 1000)
@@ -1210,8 +1211,24 @@ extension Driver {
     }
 
     func vClear(_ req: JSON) throws -> JSON {
-        try requireFront()
         searchArmed = false
+        if let expected = req["expected_input"] as? String {
+            // Undo our own paste after the user interrupted: skip the activity
+            // check, but only if WeChat is still in front and the input box
+            // still holds exactly the text we pasted (nothing of the user's).
+            try requireReady()
+            guard frontmost()?.processIdentifier == pid else {
+                throw OpError("not_frontmost", "WeChat is not the frontmost app")
+            }
+            let rect = try rectArg(req, "input_rect")
+            let winHeight = try windowOrigin().height
+            let seen = joined(try ocr(rect).items)
+            guard rect.minY >= winHeight * 0.5, !expected.isEmpty, seen == expected else {
+                throw OpError("precondition_failed", "input box no longer holds only our text")
+            }
+        } else {
+            try requireFront()
+        }
         try clickLower(try pointArg(req))
         key(.a, cmd: true)
         key(.delete)

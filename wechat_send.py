@@ -480,6 +480,11 @@ class UIDriver:
     def clear_input(self):
         raise NotImplementedError
 
+    def clear_own_text(self, text):
+        """After an interruption: delete `text` only if the input box still
+        holds exactly it. Returns True if cleared."""
+        return False
+
     def input_matches(self, current, text):
         """Does the input box (as read back) hold exactly `text`?"""
         return normalize_text(current) == normalize_text(text)
@@ -652,9 +657,12 @@ class Sender:
                 try:
                     d.clear_input()
                 except Exception:
-                    # Don't fight the user for the keyboard: the text stays as
-                    # an unsent draft in that chat.
-                    if isinstance(e, SendError):
+                    # Don't fight the user for the keyboard: remove only our
+                    # own text, else it stays as an unsent draft in that chat.
+                    cleared = False
+                    with contextlib.suppress(Exception):
+                        cleared = d.clear_own_text(text)
+                    if not cleared and isinstance(e, SendError):
                         e.extra["draft_left"] = True
                         e.extra["note"] = (f"the message is still typed (unsent) in the "
                                            f"input box of {target['name']}; delete it there")
@@ -843,16 +851,18 @@ class HelperDriver(UIDriver):
         return self.client.call("activate").get("previous_pid")
 
     def wait_idle(self, min_idle, timeout, sleep=time.sleep, clock=time.monotonic):
-        """Wait until there has been no keyboard / mouse input for min_idle s.
-        Starts the send's single helper connection (closed by session_end)."""
+        """Wait until the user hasn't typed, clicked or scrolled for min_idle s
+        (mouse movement doesn't interfere with a send, and a hand resting on a
+        trackpad produces it constantly). Starts the send's single helper
+        connection (closed by session_end)."""
         self.client.close()
         end = clock() + timeout
         while True:
-            idle = self.client.call("idle").get("any_idle_s", 0)
+            idle = self.client.call("idle").get("input_idle_s", 0)
             if idle >= min_idle:
                 return
             if clock() >= end:
-                raise UserBusy(f"you kept using the Mac for {int(timeout)} s; the send "
+                raise UserBusy(f"you kept typing/clicking for {int(timeout)} s; the send "
                                "didn't start (nothing was sent) -- try again when idle")
             sleep(max(0.2, min(1.0, min_idle - idle)))
 
@@ -1074,6 +1084,17 @@ class VisionDriver(HelperDriver):
     def clear_input(self):
         x, y = self.input_point
         self.client.call("v_clear", x=int(x), y=int(y))
+
+    def clear_own_text(self, text):
+        if self.input_rect is None:
+            return False
+        seen = self.input_text()
+        if not seen or not ocr_matches(seen, text):
+            return False
+        x, y = self.input_point
+        self.client.call("v_clear", x=int(x), y=int(y), expected_input=seen,
+                         input_rect=[int(v) for v in self.input_rect])
+        return True
 
     def press_send(self, send_key, expected_title, expected_input):
         return self.client.call("v_send", key=send_key, expected_title=expected_title,
