@@ -984,16 +984,26 @@ def _squash(text):
     return "".join(unicodedata.normalize("NFKC", text or "").split())
 
 
+def _is_cjk(ch):
+    return "\u3400" <= ch <= "\u9fff" or "\uf900" <= ch <= "\ufaff"
+
+
 def ocr_matches(seen, text, min_ratio=0.92):
     """Loose equality for OCR'd input text: line wrapping and spacing are
     ignored; a few misread characters are tolerated for longer texts, but the
-    read-back must cover the whole message (lengths within 8%)."""
+    read-back must cover the whole message (lengths within 8%). Texts under
+    12 characters must match exactly, except for one look-alike hanzi."""
     import difflib
     a, b = _squash(seen), _squash(text)
     if not a or not b:
         return False
     if a == b:
         return True
+    if len(a) == len(b) and 4 <= len(b) < 12:
+        # Short text: allow one look-alike hanzi (OCR reads 末 as 未, 己 as 已),
+        # never a different letter, digit or length.
+        diff = [(x, y) for x, y in zip(a, b) if x != y]
+        return len(diff) == 1 and all(_is_cjk(x) and _is_cjk(y) for x, y in diff)
     if len(b) < 12 or abs(len(a) - len(b)) > max(1, len(b) * 0.08):
         return False
     return difflib.SequenceMatcher(None, a, b, autojunk=False).ratio() >= min_ratio
