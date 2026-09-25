@@ -131,7 +131,7 @@ Then ask things like "what did 张三 and I decide about the trip last week?" or
 | `search_messages` | Full-text search (Chinese works) across all chats or one chat, by sender and time |
 | `get_message_context` | Messages around a message id or a time |
 | `get_contact` | Remark, nickname, alias and shared groups of a person or group |
-| `get_image` / `get_voice` | A chat image (as an image) or voice message (as audio) |
+| `get_image` / `get_voice` | A chat image or sticker (as an image; stickers are downloaded once from the WeChat CDN link in the message and cached, `"mcp_download_stickers": false` turns that off) or voice message (as audio) |
 | `get_moments` | Locally cached Moments posts, by author, time or text |
 | `search_favorites` / `get_favorite` | Search and read Favorites |
 | `refresh` | Re-decrypt changed databases now |

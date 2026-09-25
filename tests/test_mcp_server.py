@@ -325,10 +325,43 @@ class ToolsTest(Base):
         jpeg = self._write_dat("_t")
         data, ext, meta = self.data.get_image(ALICE, img_id)
         self.assertEqual((data, ext, meta["variant"], meta["id"]), (jpeg, "jpg", "thumbnail", img_id))
-        self.assertIn("not an image", self.err(self.data.get_image, ALICE, "0:1")["error"])
+        self.assertIn("not an image or sticker", self.err(self.data.get_image, ALICE, "0:1")["error"])
         self.assertIn("not found", self.err(self.data.get_image, ALICE, "0:999")["error"])
         self.assertIn("not found", self.err(self.data.get_image, ALICE, "7:1")["error"])
         self.assertIn("bad message id", self.err(self.data.get_image, ALICE, "abc")["error"])
+
+    def test_get_sticker(self):
+        md5 = "fedcba9876543210fedcba9876543210"
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+        xml = (f'<msg><emoji md5="{md5}" len="{len(png)}" '
+               f'cdnurl="http://vweixinf.tc.qq.com/110/20401/stodownload?m={md5}" '
+               f'width="240" height="240" /></msg>')
+        db = os.path.join(self.tmp, "decrypted", "message", "message_0.db")
+        lid = add_msg(db, ALICE, 47, ALICE, 300, xml)
+        sid = f"0:{lid}"
+        fetched = []
+        self.data._emoji_fetcher = lambda url, **kw: fetched.append(url) or png
+        # the sticker line carries its id, so an agent can look at it
+        lines = M.render("get_messages", self.data.get_messages(ALICE), "text").splitlines()
+        self.assertTrue(lines[-1].endswith(f"#{sid}"), lines[-1])
+        data, ext, meta = self.data.get_image(ALICE, sid)
+        self.assertEqual((data, ext, meta["kind"], meta["id"]), (png, "png", "sticker", sid))
+        self.assertEqual(len(fetched), 1)
+        self.data.get_image(ALICE, sid)  # second call: served from emoji_cache
+        self.assertEqual(len(fetched), 1)
+
+    def test_get_sticker_no_download(self):
+        d = make_data(self.tmp, mcp_download_stickers=False)
+        db = os.path.join(self.tmp, "decrypted", "message", "message_0.db")
+        lid = add_msg(db, ALICE, 47, ALICE, 300,
+                      '<msg><emoji md5="00112233445566778899aabbccddeeff" '
+                      'cdnurl="http://vweixinf.tc.qq.com/x" /></msg>')
+        d._emoji_fetcher = lambda url, **kw: self.fail("must not download")
+        self.assertIn("not available", self.err(d.get_image, ALICE, f"0:{lid}")["error"])
+        lid = add_msg(db, ALICE, 47, ALICE, 301, "<msg></msg>")
+        self.assertIn("no image reference", self.err(d.get_image, ALICE, f"0:{lid}")["error"])
+        if d._index:
+            d._index.close()
 
 
 class PolicyTest(Base):
