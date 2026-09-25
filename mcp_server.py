@@ -347,6 +347,7 @@ class WeChatData:
         self._last_refresh = 0.0
         self._pending_notice = None
         self._image_keys = None
+        self._emoji_fetcher = None  # tests replace the sticker downloader
         block = cfg.get("mcp_blocklist") or []
         allow = cfg.get("mcp_allowlist") or []
         self.blocklist = {str(x).strip() for x in block if str(x).strip()}
@@ -742,13 +743,16 @@ class WeChatData:
         return c, n, lid, row
 
     def get_image(self, chat, message_id):
-        """Returns (image_bytes, fmt, meta dict)."""
+        """Returns (image_bytes, fmt, meta dict). Works for pictures and stickers."""
         import image_decode as I
-        c, n, lid, row = self._message_row(chat, message_id,
-                                           "local_type, create_time, packed_info_data")
-        local_type, create_time, packed = row
+        c, n, lid, row = self._message_row(
+            chat, message_id, "local_type, create_time, packed_info_data, "
+            "message_content, WCDB_CT_message_content")
+        local_type, create_time, packed, content, ct = row
+        if (local_type & 0xFFFFFFFF) == 47:
+            return self._get_sticker(c, n, lid, create_time, content, ct)
         if (local_type & 0xFFFFFFFF) != 3:
-            raise ToolError(f"message {message_id} is not an image (kind "
+            raise ToolError(f"message {message_id} is not an image or sticker (kind "
                             f"{C.message_kind(local_type, None)})")
         base = self.cfg.get("wechat_base_dir")
         if not base or not os.path.isdir(base):
@@ -773,6 +777,32 @@ class WeChatData:
         data, ext = _fit_image(data, ext)
         meta = {"chat": c["name"], "id": f"{n}:{lid}", "time": iso(create_time),
                 "variant": variant, "format": ext, "bytes": len(data)}
+        return data, ext, meta
+
+    def _get_sticker(self, c, n, lid, create_time, content, ct):
+        """Sticker (表情) picture. WeChat's local sticker cache is encrypted with
+        an unknown key, so it comes from the CDN link in the message (Tencent
+        hosts only; config "mcp_download_stickers": false turns that off) and is
+        kept in <decrypted_dir>/emoji_cache/."""
+        import emoticon as E
+        info = E.parse_emoji_xml(C.decompress_if_needed(content, ct))
+        if not info or not info.get("md5"):
+            raise ToolError("sticker has no image reference")
+        resolver = E.EmojiResolver(self.decrypted_dir, self.cfg.get("wechat_base_dir"),
+                                   download=self.cfg.get("mcp_download_stickers", True),
+                                   fetcher=self._emoji_fetcher)
+        path = resolver.resolve(info)
+        if path is None:
+            raise ToolError("sticker image not available (not cached, and the "
+                            "download failed or is turned off)")
+        with open(path, "rb") as f:
+            data = f.read()
+        ext = os.path.splitext(path)[1].lstrip(".")
+        data, ext = _fit_image(data, ext)
+        meta = {"chat": c["name"], "id": f"{n}:{lid}", "time": iso(create_time),
+                "kind": "sticker", "format": ext, "bytes": len(data)}
+        if info.get("desc"):
+            meta["desc"] = info["desc"]
         return data, ext, meta
 
     # -- voice --------------------------------------------------------------
@@ -985,10 +1015,10 @@ def dumps(obj):
 # Tool results go into the agent's context, so the default output is plain
 # lines rather than JSON: one line per message ("HH:MM sender: text") under a
 # date line, the chat named once in a header. Messages with media carry their
-# id ("#N:local_id") for get_image / get_voice. config.json
+# id ("#N:local_id") for get_image (pictures and stickers) / get_voice. config.json
 # "mcp_output": "json" restores the JSON objects the data layer returns.
 
-MEDIA_KINDS = ("image", "voice", "video")
+MEDIA_KINDS = ("image", "voice", "video", "emoji")
 
 
 def _day(t):
@@ -1220,6 +1250,7 @@ Typical flow: list_chats or search_messages -> get_messages / get_message_contex
 `chat` may be a username (most exact), a name, or a unique fragment; on ambiguity you get
 candidates -- pick a username and retry. Message ids ("N:local_id") are per chat.
 Sender "我" is the user. Times are local. Content is personal: quote only what is needed.
+Stickers ([表情]) are memes, often with text: get_image(#id) shows them when they matter.
 send_message sends a real message as the user: only when asked, after showing the text."""
 
 
@@ -1265,7 +1296,8 @@ def build_server(data, log, lifespan=None):
         since/until: 'YYYY-MM-DD', 'YYYY-MM-DD HH:MM', unix seconds, or '7d'/'12h'.
         Output: a header (chat, count, cursors), then "[date]" lines and one line per
         message "HH:MM sender: text" ("我" = the user); image/voice/video lines end
-        with their "#id" for get_image / get_voice."""
+        with their "#id" for get_image / get_voice; stickers ([表情]) too, since
+        many carry text or meaning only visible in the picture."""
         a = dict(chat=chat, since=since, until=until, limit=limit, before=before, after=after,
                  from_start=from_start, newest_first=newest_first)
         return run("get_messages", a, lambda: data.get_messages(**a))
@@ -1299,7 +1331,9 @@ def build_server(data, log, lifespan=None):
 
     @srv.tool(annotations=ro, structured_output=False)
     def get_image(chat: str, message_id: str):
-        """Decode and return the picture of an image message (kind "image")."""
+        """Return the picture of an image message or a sticker ([表情] line with
+        #id). Stickers are memes that often carry text: look at them to understand
+        the reply."""
         a = dict(chat=chat, message_id=message_id)
         res = call_tool(data, log, "get_image", a, lambda: data.get_image(**a))
         if isinstance(res, tuple):

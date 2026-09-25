@@ -131,7 +131,7 @@ Claude Desktop（`~/Library/Application Support/Claude/claude_desktop_config.jso
 | `search_messages` | 全文搜索（支持中文），可限定聊天、发送者和时间 |
 | `get_message_context` | 某条消息或某个时间点前后的消息 |
 | `get_contact` | 联系人或群的备注、昵称、微信号和共同群聊 |
-| `get_image` / `get_voice` | 聊天图片（以图片返回）或语音（以音频返回） |
+| `get_image` / `get_voice` | 聊天图片或表情（以图片返回，表情从消息里的微信 CDN 地址下载一次并缓存；`"mcp_download_stickers": false` 可关闭）或语音（以音频返回） |
 | `get_moments` | 本地缓存的朋友圈，可按作者、时间、内容筛选 |
 | `search_favorites` / `get_favorite` | 搜索和读取收藏 |
 | `refresh` | 立即重新解密有变化的数据库 |
