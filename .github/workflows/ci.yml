@@ -45,17 +45,13 @@ jobs:
         run: python -m unittest discover -s tests -v
 
   build-lint:
-    name: Build C scanner / Swift helper, shellcheck
+    name: Build C scanner / backup launcher, shellcheck
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Compile key scanner
         run: cc -O2 -Wall -Wextra -Werror -o "$RUNNER_TEMP/find_all_keys_macos" find_all_keys_macos.c -framework Foundation
-
-      - name: Build Swift helper
-        if: hashFiles('helper/build.sh') != ''
-        run: bash helper/build.sh --force
 
       - name: Build backup launcher app
         run: bash launcher/build.sh --force
@@ -66,4 +62,4 @@ jobs:
       - name: shellcheck
         run: |
           shopt -s nullglob
-          shellcheck setup.sh wechat helper/*.sh launcher/*.sh
+          shellcheck setup.sh wechat launcher/*.sh
