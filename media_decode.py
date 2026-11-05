@@ -297,24 +297,28 @@ class VoiceStore:
         return self._ids[key]
 
     def get(self, username, server_id=None, create_time=None, local_id=None):
-        """Voice blob (SILK bytes) for a message, or None if not stored."""
-        for i, conn in enumerate(self._connections()):
-            cid = self._chat_id(i, conn, username)
-            if cid is None:
-                continue
-            rows = []
-            if server_id:
+        """Voice blob (SILK bytes) for a message, or None if not stored.
+
+        Search every database for a server ID before trying the less specific
+        (create_time, local_id) fallback, whose IDs can overlap across shards.
+        """
+        lookups = []
+        if server_id:
+            lookups.append(("svr_id=?", (server_id,)))
+        if create_time is not None and local_id is not None:
+            lookups.append(("create_time=? AND local_id=?", (create_time, local_id)))
+        for clause, params in lookups:
+            for i, conn in enumerate(self._connections()):
+                cid = self._chat_id(i, conn, username)
+                if cid is None:
+                    continue
                 rows = conn.execute(
                     "SELECT data_index, voice_data FROM VoiceInfo WHERE chat_name_id=? "
-                    "AND svr_id=?", (cid, server_id)).fetchall()
-            if not rows and create_time is not None and local_id is not None:
-                rows = conn.execute(
-                    "SELECT data_index, voice_data FROM VoiceInfo WHERE chat_name_id=? "
-                    "AND create_time=? AND local_id=?", (cid, create_time, local_id)).fetchall()
-            rows = [(d, b) for d, b in rows if b]
-            if rows:
-                rows.sort(key=lambda r: int(r[0]) if str(r[0]).isdigit() else 0)
-                return b"".join(bytes(b) for _, b in rows)
+                    "AND " + clause, (cid,) + params).fetchall()
+                rows = [(d, b) for d, b in rows if b]
+                if rows:
+                    rows.sort(key=lambda r: int(r[0]) if str(r[0]).isdigit() else 0)
+                    return b"".join(bytes(b) for _, b in rows)
         return None
 
 
