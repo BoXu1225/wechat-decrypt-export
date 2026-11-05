@@ -201,6 +201,34 @@ class VoiceStoreTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp)
 
+    def test_server_id_in_later_database_precedes_local_fallback(self):
+        # Message-local IDs can overlap between shards. The first shard has
+        # only a fallback candidate; the second has the requested server ID.
+        make_media_db(os.path.join(self.tmp, "message", "media_1.db"), [
+            (ALICE, 300, 12, 999, b"#!SILK_V3-exact"),
+        ])
+        with M.VoiceStore(self.tmp) as s:
+            self.assertEqual(s.get(ALICE, 999, 101, 7), b"#!SILK_V3-exact")
+
+    def test_local_fallback_after_server_id_misses_all_databases(self):
+        make_media_db(os.path.join(self.tmp, "message", "media_1.db"), [
+            (ALICE, 300, 12, 888, b"#!SILK_V3-fallback"),
+        ])
+        with M.VoiceStore(self.tmp) as s:
+            self.assertEqual(s.get(ALICE, 999, 300, 12), b"#!SILK_V3-fallback")
+            self.assertEqual(s.get(ALICE, None, 300, 12), b"#!SILK_V3-fallback")
+            self.assertIsNone(s.get(ALICE, 999, 301, 12))
+
+    def test_empty_server_blob_does_not_preempt_later_exact_match(self):
+        make_media_db(os.path.join(self.tmp, "message", "media_1.db"), [
+            (ALICE, 300, 12, 999, b""),
+        ])
+        make_media_db(os.path.join(self.tmp, "message", "media_2.db"), [
+            (ALICE, 300, 12, 999, b"#!SILK_V3-exact"),
+        ])
+        with M.VoiceStore(self.tmp) as s:
+            self.assertEqual(s.get(ALICE, 999, 101, 7), b"#!SILK_V3-exact")
+
     def test_lookup(self):
         with M.VoiceStore(self.tmp) as s:
             self.assertEqual(s.get(ALICE, 555), b"A")
